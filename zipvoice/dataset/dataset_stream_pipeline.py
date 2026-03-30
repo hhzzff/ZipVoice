@@ -37,7 +37,6 @@ class SpeechSynthesisDataset(torch.utils.data.Dataset):
         return_spk_ids: bool = False,
         return_cuts: bool = False,
         return_audio: bool = False,
-        return_alignment: bool = False,
     ) -> None:
         super().__init__()
 
@@ -49,7 +48,6 @@ class SpeechSynthesisDataset(torch.utils.data.Dataset):
         self.return_spk_ids = return_spk_ids
         self.return_cuts = return_cuts
         self.return_audio = return_audio
-        self.return_alignment = return_alignment
 
         if feature_transforms is None:
             feature_transforms = []
@@ -95,9 +93,6 @@ class SpeechSynthesisDataset(torch.utils.data.Dataset):
 
         if self.return_cuts:
             batch["cut"] = [cut for cut in cuts]
-        
-        if self.return_alignment:
-            batch["alignment"] = [cut.supervisions[0].alignment for cut in cuts]
 
         return batch
 

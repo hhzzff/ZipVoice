@@ -25,6 +25,9 @@ import logging
 from functools import lru_cache
 from pathlib import Path
 from typing import Any, Dict, Optional
+from praatio import textgrid
+from pathlib import Path
+
 
 import torch
 from lhotse import CutSet, load_manifest_lazy
@@ -136,6 +139,14 @@ class TtsDataModule:
             "were used to construct it.",
         )
         group.add_argument(
+            "--return-timestamps",
+            type=str2bool,
+            default=False,
+            help="When enabled, each batch will have the "
+            "field: batch['timestamp'] with the timestamps that "
+            "were used to construct it.",
+        )
+        group.add_argument(
             "--num-workers",
             type=int,
             default=8,
@@ -172,7 +183,6 @@ class TtsDataModule:
             if self.args.on_the_fly_feats
             else PrecomputedFeatures(),
             return_cuts=self.args.return_cuts,
-            return_alignment=True,
         )
 
         if self.args.bucketing_sampler:
@@ -225,7 +235,6 @@ class TtsDataModule:
             if self.args.on_the_fly_feats
             else PrecomputedFeatures(),
             return_cuts=self.args.return_cuts,
-            return_alignment=True,
         )
         dev_sampler = DynamicBucketingSampler(
             cuts_valid,
@@ -253,7 +262,6 @@ class TtsDataModule:
             if self.args.on_the_fly_feats
             else PrecomputedFeatures(),
             return_cuts=self.args.return_cuts,
-            return_alignment=True,
             return_audio=True,
         )
         test_sampler = DynamicBucketingSampler(
@@ -311,14 +319,14 @@ class TtsDataModule:
             train-clean-360 and train-other-500 cuts"
         )
         return load_manifest_lazy(
-            self.args.manifest_dir / "libritts_cuts_train-all-shuf_aligned.jsonl.gz"
+            self.args.manifest_dir / "libritts_cuts_train-all-shuf.jsonl.gz"
         )
 
     @lru_cache()
     def dev_libritts_cuts(self) -> CutSet:
         logging.info("About to get dev-clean cuts")
         return load_manifest_lazy(
-            self.args.manifest_dir / "libritts_cuts_dev-clean_aligned.jsonl.gz"
+            self.args.manifest_dir / "libritts_cuts_dev-clean.jsonl.gz"
         )
 
     @lru_cache()
@@ -348,3 +356,27 @@ class TtsDataModule:
         return load_manifest_lazy(
             self.args.manifest_dir / "opendialog_cuts_ZH-dev.jsonl.gz"
         )
+
+    def parse_textgrid(path):
+        tg = textgrid.openTextgrid(path, includeEmptyIntervals=False)
+
+        out = {}
+
+        for tier_name in ["words", "phones"]:
+            tier = tg.getTier(tier_name)
+            intervals = []
+
+            for start, end, label in tier.entries:
+                label = label.strip()
+                # if label == "":
+                #     continue
+                intervals.append(
+                    {
+                        "text": label,
+                        "start": float(start),
+                        "end": float(end),
+                    }
+                )
+            out[tier_name] = intervals
+
+        return out
