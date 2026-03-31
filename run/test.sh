@@ -5,7 +5,7 @@ export CUDA_VISIBLE_DEVICES="0,1"
 
 EXP_DIR="exp/zipvoice_libritts_0326_1653_stream_alignmask_fixedwindow"
 RES_DIR="${EXP_DIR/exp/res}"
-CHECKPOINT_NAME="epoch-100.pt"
+CHECKPOINT_NAME="epoch-170.pt"
 EXTRA="-tshift0.7-step8"
 
 python3 -m zipvoice.bin.infer_zipvoice_stream_fixed_window \

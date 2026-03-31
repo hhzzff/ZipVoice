@@ -210,7 +210,7 @@ class ZipVoice(nn.Module):
         )
         tokens_padded = pad_labels(tokens, pad_id=self.pad_id, device=device)  # (B, S)
         embed = self.embed(tokens_padded)  # (B, S, C)
-        print(f"embed: {embed} self.embed.weight: {self.embed.weight}")
+        # print(f"embed: {embed} self.embed.weight: {self.embed.weight}")
         tokens_lens = torch.tensor(
             [len(token) for token in tokens], dtype=torch.int64, device=device
         )
@@ -329,7 +329,7 @@ class ZipVoice(nn.Module):
         )
 
         cat_embed, cat_tokens_lens = self.forward_text_embed(cat_tokens)
-        print(f"cat_tokens: {cat_tokens} cat_tokens_lens: {cat_tokens_lens} cat_embed: {cat_embed}")
+        # print(f"cat_tokens: {cat_tokens} cat_tokens_lens: {cat_tokens_lens} cat_embed: {cat_embed}")
 
         features_lens = prompt_features_lens + torch.ceil(
             (prompt_features_lens / prompt_tokens_lens * tokens_lens / speed)
@@ -760,7 +760,7 @@ class ZipVoice(nn.Module):
 
         assert duration in ["real", "predict"]
 
-        print(f"tokens:{tokens} Prompt tokens: {prompt_tokens} prompt_features_lens:{prompt_features_lens}")
+        # print(f"tokens:{tokens} Prompt tokens: {prompt_tokens} prompt_features_lens:{prompt_features_lens}")
 
         if duration == "predict":
             (
@@ -819,8 +819,8 @@ class ZipVoice(nn.Module):
             guidance_scale=guidance_scale,
             t_shift=t_shift,
         )
-        print(f"x1[0, :5, 0]: {x1[0, :5, 0]}")
-        print(f"x0:{x0} text_condition:{text_condition} speech_condition:{speech_condition} padding_mask:{padding_mask}")
+        # print(f"x1[0, :5, 0]: {x1[0, :5, 0]}")
+        # print(f"x0:{x0} text_condition:{text_condition} speech_condition:{speech_condition} padding_mask:{padding_mask}")
         # rms = torch.sqrt(torch.mean(torch.exp(x1) ** 2, dim=-1))  # shape [T]
         # rms_np = rms.detach().cpu().numpy()
         # rmsx0 = torch.sqrt(torch.mean(torch.exp(x0) ** 2, dim=-1))  # shape [T]
