@@ -103,6 +103,9 @@ class DiffusionModel(torch.nn.Module):
                     [speech_condition, speech_condition], dim=0
                 )
 
+            if "text_padding_mask" in kwargs and kwargs["text_padding_mask"] is not None:
+                kwargs["text_padding_mask"] = torch.cat([kwargs["text_padding_mask"]] * 2, dim=0)
+
             data_uncond, data_cond = self.model_func(
                 t=t,
                 xt=x,

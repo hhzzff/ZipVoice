@@ -250,27 +250,6 @@ class ZipVoice(nn.Module):
         # print(f"shape: text_condition: {text_condition.shape} padding_mask: {padding_mask.shape} text_padding_mask: {text_padding_mask.shape} tokens_lens:{tokens_lens}")
         return text_condition, padding_mask, text_padding_mask
 
-
-
-        num_frames = int(features_lens.max())
-
-        padding_mask = make_pad_mask(features_lens, max_len=num_frames)  # (B, T)
-
-        tokens_durations = prepare_avg_tokens_durations(features_lens, tokens_lens)
-
-        tokens_index = get_tokens_index(tokens_durations, num_frames).to(
-            embed.device
-        )  # (B, T)
-
-        text_condition = torch.gather(
-            embed,
-            dim=1,
-            index=tokens_index.unsqueeze(-1).expand(
-                embed.size(0), num_frames, embed.size(-1)
-            ),
-        )  # (B, T, F)
-        return text_condition, padding_mask
-
     def forward_text_train(
         self,
         tokens: List[List[int]],

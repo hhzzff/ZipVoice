@@ -649,7 +649,12 @@ class Zipformer2EncoderLayer(nn.Module):
             key_padding_mask=src_key_padding_mask,
             text_padding_mask=text_padding_mask,
         )
-        src = src + self.cross_attn(text_x, cross_attn_weights=cross_w)
+        cross_attn_out = self.cross_attn(text_x, cross_attn_weights=cross_w)
+        src = src + (
+            cross_attn_out
+            if self_attn_dropout_mask is None
+            else cross_attn_out * self_attn_dropout_mask
+        )
 
 
         if self.use_conv:
@@ -1427,14 +1432,23 @@ class CrossMultiheadAttentionWeights(nn.Module):
         self.all_head_dim = num_heads * query_head_dim
 
         # Query 投影层 (来自 Speech)
-        self.q_proj = nn.Linear(embed_dim, self.all_head_dim, bias=False)
+        self.q_proj = ScaledLinear(embed_dim, self.all_head_dim, bias=False,
+                                   initial_scale=query_head_dim**-0.25)
         # Key 投影层 (来自 Text)
-        self.k_proj = nn.Linear(embed_dim, self.all_head_dim, bias=False)
+        self.k_proj = ScaledLinear(embed_dim, self.all_head_dim, bias=False,
+                                   initial_scale=query_head_dim**-0.25)
 
-        # 遵循 Zipformer 风格：使用 Balancer 稳定激活值，使用 Whiten 去相关性
-        # 如果你的基础代码里没有这两个模块，可以直接注释掉，或者替换为 LayerNorm
-        # self.balance_keys = Balancer(self.all_head_dim, ... )
-        # self.whiten_keys = Whiten(num_heads, query_head_dim, ... )
+        self.balance_keys = Balancer(
+            self.all_head_dim, channel_dim=-1,
+            min_positive=0.4, max_positive=0.6,
+            min_abs=0.0, max_abs=100.0, prob=0.025,
+        )
+        self.whiten_keys = Whiten(
+            num_groups=num_heads,
+            whitening_limit=_whitening_schedule(3.0),
+            prob=(0.025, 0.25),
+            grad_scale=0.025,
+        )
 
         self.dropout = nn.Dropout(dropout)
 
@@ -1455,8 +1469,7 @@ class CrossMultiheadAttentionWeights(nn.Module):
         # k: (T_k, B, H * D_q)
         k = self.k_proj(key)
 
-        # Zipformer 特色的激活稳定操作 (可选)
-        # k = self.whiten_keys(self.balance_keys(k))
+        k = self.whiten_keys(self.balance_keys(k))
 
         # 2. Reshape 和 Permute 为批量矩阵乘法做准备
         # q: (B, H, T_q, D_q)
@@ -1571,12 +1584,17 @@ class CrossAttention(nn.Module):
 
         # Value 投影层 (来自 Text)
         self.v_proj = nn.Linear(embed_dim, self.all_head_dim, bias=False)
-        
-        # Output 投影层 (融合后输出给 Speech)
-        self.out_proj = nn.Linear(self.all_head_dim, embed_dim, bias=False)
 
-        # Zipformer 风格：在投影前稳定数值
-        # self.balance_values = Balancer(self.all_head_dim, ...)
+        # Output 投影层 (融合后输出给 Speech)
+        self.out_proj = ScaledLinear(self.all_head_dim, embed_dim, bias=False,
+                                     initial_scale=0.05)
+
+        self.whiten = Whiten(
+            num_groups=1,
+            whitening_limit=_whitening_schedule(7.5, ratio=3.0),
+            prob=(0.025, 0.25),
+            grad_scale=0.01,
+        )
         
     def forward(
         self, 
@@ -1593,9 +1611,6 @@ class CrossAttention(nn.Module):
         # 1. 计算 Value
         # v: (T_k, B, H * D_v)
         v = self.v_proj(text_x)
-        
-        # 可选的 Zipformer 稳定器
-        # v = self.balance_values(v)
 
         # 2. Reshape 和 Permute
         # v: (B, H, T_k, D_v)
@@ -1614,6 +1629,7 @@ class CrossAttention(nn.Module):
         # 5. 最终输出投影，恢复到网络主干维度
         # final_out: (T_q, B, C)
         final_out = self.out_proj(out)
+        final_out = self.whiten(final_out)
 
         return final_out
 

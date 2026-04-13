@@ -380,6 +380,8 @@ class Zipformer2EncoderLayer(nn.Module):
 
         self.self_attn2 = SelfAttention(embed_dim, num_heads, value_head_dim)
 
+        self.cross_attn = CrossAttention(embed_dim, num_heads, query_head_dim, value_head_dim)
+
         self.feed_forward1 = FeedforwardModule(
             embed_dim, (feedforward_dim * 3) // 4, dropout
         )
@@ -498,7 +500,7 @@ class Zipformer2EncoderLayer(nn.Module):
         Pass the input through the encoder layer.
         Args:
           src: the sequence to the encoder (required):
-            shape (seq_len, batch_size, embedding_dim).
+            shape (seq_len, batch_size, embedding_dim * 3) - concatenated [noise, text, speech].
           pos_emb: (1, 2*seq_len-1, pos_emb_dim) or
             (batch_size, 2*seq_len-1, pos_emb_dim)
           time_emb: the embedding representing the current timestep
@@ -512,6 +514,11 @@ class Zipformer2EncoderLayer(nn.Module):
         Returns:
            A tensor which has the same shape as src
         """
+        seq_len, batch_size, total_dim = src.shape
+        base_dim = total_dim // 3
+        noise, text_cond, speech_cond = src.split(base_dim, dim=-1)
+
+        src = noise
         src_orig = src
 
         # dropout rate for non-feedforward submodules
@@ -561,12 +568,12 @@ class Zipformer2EncoderLayer(nn.Module):
             na if self_attn_dropout_mask is None else na * self_attn_dropout_mask
         )
 
-        self_attn = self.self_attn1(src, attn_weights)
+        cross_attn = self.cross_attn(text_cond, speech_cond)
 
         src = src + (
-            self_attn
+            cross_attn
             if self_attn_dropout_mask is None
-            else self_attn * self_attn_dropout_mask
+            else cross_attn * self_attn_dropout_mask
         )
 
         if self.use_conv:
@@ -597,12 +604,12 @@ class Zipformer2EncoderLayer(nn.Module):
         # bypass in the middle of the layer.
         src = self.bypass_mid(src_orig, src)
 
-        self_attn = self.self_attn2(src, attn_weights)
+        cross_attn = self.cross_attn(text_cond, speech_cond)
 
         src = src + (
-            self_attn
+            cross_attn
             if self_attn_dropout_mask is None
-            else self_attn * self_attn_dropout_mask
+            else cross_attn * self_attn_dropout_mask
         )
 
         if self.use_conv:
@@ -639,7 +646,7 @@ class Zipformer2EncoderLayer(nn.Module):
         src = self.balancer2(src)
         src = self.whiten(src)
 
-        return src
+        return torch.cat([src, text_cond, speech_cond], dim=-1)
 
 
 class Zipformer2Encoder(nn.Module):
@@ -1390,6 +1397,63 @@ class SelfAttention(nn.Module):
         )
 
         # returned value is of shape (seq_len, batch_size, embed_dim), like the input.
+        x = self.out_proj(x)
+        x = self.whiten(x)
+
+        return x
+
+
+class CrossAttention(nn.Module):
+    """
+    Cross-attention between text and speech conditions.
+
+    Args:
+          embed_dim: the input and output embedding dimension (base_dim)
+          num_heads: the number of attention heads
+          query_head_dim: dimension of query and key per head
+          value_head_dim: the value dimension per head
+    """
+
+    def __init__(
+        self,
+        embed_dim: int,
+        num_heads: int,
+        query_head_dim: int,
+        value_head_dim: int,
+    ) -> None:
+        super().__init__()
+        self.embed_dim = embed_dim
+        self.num_heads = num_heads
+        self.query_head_dim = query_head_dim
+        self.value_head_dim = value_head_dim
+
+        self.q_proj = ScaledLinear(embed_dim, num_heads * query_head_dim, bias=True, initial_scale=query_head_dim**-0.25)
+        self.k_proj = ScaledLinear(embed_dim, num_heads * query_head_dim, bias=True, initial_scale=query_head_dim**-0.25)
+        self.v_proj = nn.Linear(embed_dim, num_heads * value_head_dim, bias=True)
+
+        self.out_proj = ScaledLinear(num_heads * value_head_dim, embed_dim, bias=True, initial_scale=0.05)
+
+        self.whiten = Whiten(num_groups=1, whitening_limit=_whitening_schedule(7.5, ratio=3.0), prob=(0.025, 0.25), grad_scale=0.01)
+
+    def forward(self, text: Tensor, speech: Tensor) -> Tensor:
+        """
+        Args:
+          text: text condition tensor, shape (seq_len, batch_size, embed_dim)
+          speech: speech condition tensor, shape (seq_len, batch_size, embed_dim)
+        Returns:
+           output tensor with shape (seq_len, batch_size, embed_dim)
+        """
+        seq_len, batch_size, _ = text.shape
+
+        q = self.q_proj(text).reshape(seq_len, batch_size, self.num_heads, self.query_head_dim).permute(2, 1, 0, 3)
+        k = self.k_proj(speech).reshape(seq_len, batch_size, self.num_heads, self.query_head_dim).permute(2, 1, 3, 0)
+        v = self.v_proj(speech).reshape(seq_len, batch_size, self.num_heads, self.value_head_dim).permute(2, 1, 0, 3)
+
+        attn_scores = torch.matmul(q, k)
+        attn_weights = softmax(attn_scores, dim=-1)
+
+        x = torch.matmul(attn_weights, v)
+        x = x.permute(2, 1, 0, 3).contiguous().view(seq_len, batch_size, self.num_heads * self.value_head_dim)
         x = self.out_proj(x)
         x = self.whiten(x)
 
