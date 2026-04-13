@@ -1,9 +1,9 @@
 if [[ ":$PYTHONPATH:" != *":$(pwd):"* ]]; then
     export PYTHONPATH="$PYTHONPATH:../../."
 fi
-export CUDA_VISIBLE_DEVICES="0,1,2,3"
+export CUDA_VISIBLE_DEVICES="4,5,6,7"
 
-EXP_DIR="exp/zipvoice_libritts_0326_1653_stream_alignmask_fixedwindow"
+EXP_DIR="exp/zipvoice_libritts_0409_1713_stream_alignmask_fixedwindow_crossattn"
 CONFIG_FILE="conf/zipvoice_base.json"
 
 if [ -d "$EXP_DIR" ]; then
@@ -17,7 +17,7 @@ cp "$SCRIPT_PATH" "$EXP_DIR/"
 cp "$CONFIG_FILE" "$EXP_DIR/"
 echo "Copied train.sh, $CONFIG_FILE to $EXP_DIR"
 
-python3 -m zipvoice.bin.train_zipvoice_stream_fixedwindow \
+python3 -m zipvoice.bin.train_zipvoice_stream_fixedwindow_crossattn \
     --world-size 4 \
 	--use-fp16 0 \
 	--num-epochs 200 \
@@ -31,4 +31,5 @@ python3 -m zipvoice.bin.train_zipvoice_stream_fixedwindow \
 	--dataset libritts \
 	--exp-dir "$EXP_DIR" \
 	--manifest-dir aligned_data/fbank \
-	--feat-scale 0.1
+	--feat-scale 0.1 \
+	--master-port 12357
