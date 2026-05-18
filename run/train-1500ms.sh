@@ -3,8 +3,20 @@ if [[ ":$PYTHONPATH:" != *":$(pwd):"* ]]; then
 fi
 export CUDA_VISIBLE_DEVICES="0,1"
 
-EXP_DIR="exp/zipvoice_libritts_0512_1652_stream_alignmask_fixedwindow_crossattn"
+TS="$(date +%m%d_%H%M)"
+EXP_DIR="exp/zipvoice_libritts_${TS}_stream_alignmask_fixedwindow_crossattn"
 CONFIG_FILE="conf/zipvoice_base-1500ms.json"
+
+if [ -d "$EXP_DIR" ]; then
+    echo "Error: Directory '$EXP_DIR' already exists. Aborting to avoid overwriting."
+    exit 1
+fi
+
+mkdir -p $EXP_DIR
+SCRIPT_PATH="$(readlink -f "$0")"
+cp "$SCRIPT_PATH" "$EXP_DIR/"
+cp "$CONFIG_FILE" "$EXP_DIR/"
+echo "Copied train.sh, $CONFIG_FILE to $EXP_DIR"
 
 python3 -m zipvoice.bin.train_zipvoice_stream_fixedwindow_crossattn \
     --world-size 2 \
@@ -21,5 +33,4 @@ python3 -m zipvoice.bin.train_zipvoice_stream_fixedwindow_crossattn \
 	--exp-dir "$EXP_DIR" \
 	--manifest-dir aligned_data/fbank \
 	--feat-scale 0.1 \
-	--master-port 11451 \
-	--start-epoch 46
+	--master-port 11451

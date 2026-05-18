@@ -357,7 +357,7 @@ class ZipVoice(nn.Module):
                 return alignment_item.get("words", [])
             return []
 
-        window_size = 30
+        window_size = 150
         mask_starts_list = []
         mask_ends_list = []
 
@@ -410,8 +410,8 @@ class ZipVoice(nn.Module):
                     mask_word_idx = w_idx
                     break
 
-            # 在该位置后额外保留 1~3 个词。
-            keep_extra_words = random.randint(1, 3)
+            # 在该位置后额外保留 0~8 个词。
+            keep_extra_words = random.randint(0, 8)
             cutoff_word_idx = min(len(words) - 1, mask_word_idx + keep_extra_words)
 
             full_text = "".join([id2textDict.get(int(t), "") for t in tok])
@@ -848,7 +848,7 @@ class ZipVoice(nn.Module):
         # plt.close()
         # print("-----------------------------------------------------------")
         
-        window_size = 30
+        window_size = 150
         x1_wo_prompt_lens = min(window_size, (x1.size(1) - prompt_features_lens).max())
         x1_prompt = torch.zeros(
             x1.size(0), prompt_features_lens.max(), x1.size(2), device=x1.device

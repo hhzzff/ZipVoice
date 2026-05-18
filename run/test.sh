@@ -3,10 +3,10 @@ if [[ ":$PYTHONPATH:" != *":$(pwd):"* ]]; then
 fi
 export CUDA_VISIBLE_DEVICES="0,1"
 
-EXP_DIR="exp/zipvoice_libritts_0409_1713_stream_alignmask_fixedwindow_crossattn"
+EXP_DIR="exp/zipvoice_libritts_0512_1652_stream_alignmask_fixedwindow_crossattn"
 RES_DIR="${EXP_DIR/exp/res}"
-CHECKPOINT_NAME="epoch-130.pt"
-EXTRA="-tshift0.7-step8"
+CHECKPOINT_NAME="epoch-125.pt"
+EXTRA="-tshift0.7-step16-guide1-wp0514"
 
 python3 -m zipvoice.bin.infer_zipvoice_stream_fixed_window_crossattn \
     --model-name zipvoice \
@@ -15,8 +15,8 @@ python3 -m zipvoice.bin.infer_zipvoice_stream_fixed_window_crossattn \
     --tokenizer libritts \
     --test-list test.tsv \
     --res-dir "${RES_DIR}/${CHECKPOINT_NAME}${EXTRA}" \
-    --num-step 8 \
+    --num-step 16 \
     --guidance-scale 1 \
     --t-shift 0.7 \
     --feat-scale 0.1 \
-    --speed 0.8
+    --word-pointer-ckpt exp_pointer/libritts_0514_1704/word_pointer.pt

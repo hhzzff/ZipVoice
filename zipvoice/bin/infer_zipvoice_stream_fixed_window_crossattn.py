@@ -64,6 +64,7 @@ import argparse
 import datetime as dt
 import json
 import logging
+import math
 import os
 from pathlib import Path
 from typing import Optional
@@ -79,6 +80,7 @@ from huggingface_hub import hf_hub_download
 from lhotse.utils import fix_random_seed
 from vocos import Vocos
 
+from zipvoice.models.word_pointer import WordPointer
 from zipvoice.models.zipvoice_stream_fixedwindow_crossattn import ZipVoice
 from zipvoice.models.zipvoice_distill import ZipVoiceDistill
 from zipvoice.tokenizer.tokenizer import (
@@ -233,6 +235,32 @@ def get_parser():
     )
 
     parser.add_argument(
+        "--word-pointer-ckpt",
+        type=Path,
+        default=None,
+        help="Path to word_pointer.pt. Required for streaming; the pointer "
+             "head predicts how many target words the just-generated chunk "
+             "covered, replacing the duration-ratio heuristic.",
+    )
+
+    parser.add_argument(
+        "--word-pointer-max-pad",
+        type=int,
+        default=4,
+        help="Should match the max_pad used at training time. Used only as "
+             "a sanity check against the value stored in the checkpoint.",
+    )
+
+    parser.add_argument(
+        "--word-pointer-min-frames",
+        type=int,
+        default=150,
+        help="Minimum cumulative generated mel frames before invoking the "
+             "WordPointer (it was trained on chunks of this many frames). "
+             "Below this, fall back to the ratio heuristic.",
+    )
+
+    parser.add_argument(
         "--speed",
         type=float,
         default=1.0,
@@ -298,7 +326,382 @@ def get_parser():
         default=None,
         help="The path to the TensorRT engine file.",
     )
+
+    parser.add_argument(
+        "--debug-plot-dir",
+        type=Path,
+        default=None,
+        help="Optional directory to save per-step debug plots.",
+    )
+
+    parser.add_argument(
+        "--debug-plot-every",
+        type=int,
+        default=1,
+        help="Save debug plots every N chunks when --debug-plot-dir is set.",
+    )
+
+    parser.add_argument(
+        "--save-chunk-wavs",
+        type=str2bool,
+        default=False,
+        help="Whether to save each decoded streaming chunk as a separate wav.",
+    )
+
+    parser.add_argument(
+        "--trim-tail-noise",
+        type=str2bool,
+        default=True,
+        help="Trim trailing broadband hiss that can appear when the streaming "
+             "window runs out of text.",
+    )
+
+    parser.add_argument(
+        "--tail-noise-min-ms",
+        type=float,
+        default=120.0,
+        help="Minimum detected trailing-noise duration before trimming.",
+    )
+
+    parser.add_argument(
+        "--tail-noise-keep-ms",
+        type=float,
+        default=40.0,
+        help="Keep this much audio before the detected trailing-noise region.",
+    )
+
     return parser
+
+
+def _safe_plot_name(text: str, max_len: int = 80) -> str:
+    return re.sub(r"[^A-Za-z0-9._-]", "_", text)[:max_len]
+
+
+def _to_int(value) -> int:
+    if torch.is_tensor(value):
+        return int(value.item())
+    return int(value)
+
+
+def _save_prompt_debug_plot(
+    debug_dir: Optional[Path],
+    sample_tag: str,
+    prompt_wav: torch.Tensor,
+    prompt_features: torch.Tensor,
+    sampling_rate: int,
+) -> None:
+    if debug_dir is None:
+        return
+
+    debug_dir.mkdir(parents=True, exist_ok=True)
+    out_path = debug_dir / f"{sample_tag}_prompt_overview.png"
+
+    prompt_wav_np = prompt_wav[0].detach().cpu().numpy()
+    prompt_feat_rms = torch.sqrt(torch.mean(torch.exp(prompt_features) ** 2, dim=-1))
+    prompt_feat_rms_np = prompt_feat_rms[0].detach().cpu().numpy()
+
+    t_wave = np.arange(prompt_wav_np.shape[0]) / sampling_rate
+    t_feat = np.arange(prompt_feat_rms_np.shape[0]) * 256 / sampling_rate
+
+    fig, axes = plt.subplots(2, 1, figsize=(14, 8), sharex=False)
+    axes[0].plot(t_wave, prompt_wav_np, linewidth=0.8)
+    axes[0].set_title("Prompt waveform")
+    axes[0].set_xlabel("Time (s)")
+    axes[0].set_ylabel("Amplitude")
+
+    axes[1].plot(t_feat, prompt_feat_rms_np, linewidth=0.8)
+    axes[1].set_title("Prompt mel RMS")
+    axes[1].set_xlabel("Time (s)")
+    axes[1].set_ylabel("RMS")
+
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=160)
+    plt.close(fig)
+
+
+def _save_stream_debug_plot(
+    debug_dir: Optional[Path],
+    sample_tag: str,
+    step_idx: int,
+    target_words: list,
+    text_chunk_str: str,
+    expected_word_pos: int,
+    lookahead_end: int,
+    committed_word_pos: int,
+    generated_new_frames: int,
+    est_total_new_frames: int,
+    fixed_chunk_frames: int,
+    pred_features_lens: int,
+    actual_chunk_frames: int,
+    src: str,
+) -> None:
+    print(f"debug_dir:{debug_dir}, step_idx:{step_idx}, expected_word_pos:{expected_word_pos}, ")
+    if debug_dir is None:
+        return
+
+    debug_dir.mkdir(parents=True, exist_ok=True)
+
+    fig = plt.figure(figsize=(15, 9))
+    gs = fig.add_gridspec(2, 1, height_ratios=[2.0, 1.0])
+
+    ax0 = fig.add_subplot(gs[0, 0])
+    words_total = len(target_words)
+    ax0.axhline(words_total, color="gray", linestyle="--", linewidth=1.0, label="total words")
+    ax0.axhline(committed_word_pos, color="tab:green", linestyle=":", linewidth=1.0)
+    ax0.bar([step_idx - 0.25], [expected_word_pos], width=0.2, color="tab:blue", alpha=0.65, label="expected")
+    ax0.bar([step_idx], [lookahead_end], width=0.2, color="tab:orange", alpha=0.65, label="lookahead_end")
+    ax0.bar([step_idx + 0.25], [committed_word_pos], width=0.2, color="tab:green", alpha=0.75, label="committed")
+    ax0.set_title(f"Word progression | step={step_idx} src={src} | chunk='{text_chunk_str}'")
+    ax0.set_xlabel("Step index")
+    ax0.set_ylabel("Word position")
+    ax0.set_xlim(-0.5, max(3, step_idx + 1.5))
+    ax0.set_ylim(0, max(words_total + 1, committed_word_pos + 3, lookahead_end + 3))
+    ax0.legend(loc="upper left")
+    ax0.grid(True, axis="y", alpha=0.2)
+
+    ax1 = fig.add_subplot(gs[1, 0])
+    xs = [0, 1, 2, 3]
+    ys = [generated_new_frames, est_total_new_frames, fixed_chunk_frames, pred_features_lens]
+    labels = ["generated", "estimated_total", "fixed_chunk", "pred_len"]
+    colors = ["tab:green", "tab:red", "tab:blue", "tab:purple"]
+    ax1.bar(xs, ys, color=colors, alpha=0.75)
+    ax1.set_xticks(xs, labels)
+    ax1.set_ylabel("Frames")
+    ax1.set_title("Frame budget")
+    ax1.grid(True, axis="y", alpha=0.2)
+    ax1.text(
+        0.02,
+        0.95,
+        f"actual_chunk_frames={actual_chunk_frames}",
+        transform=ax1.transAxes,
+        va="top",
+        ha="left",
+        bbox=dict(boxstyle="round,pad=0.2", fc="white", ec="0.8"),
+    )
+
+    fig.tight_layout()
+    out_path = debug_dir / f"{sample_tag}_step_{step_idx:03d}_progress.png"
+    fig.savefig(out_path, dpi=160)
+    plt.close(fig)
+
+
+def _save_word_pointer_heatmap(
+    debug_dir: Optional[Path],
+    sample_tag: str,
+    step_idx: int,
+    wp_probs: Optional[torch.Tensor],
+    wp_max_pad: int,
+    pred_l: Optional[int],
+    pred_r: Optional[int],
+    lookahead_end: int,
+    committed_word_pos: int,
+    text_chunk_str: str,
+) -> None:
+    if debug_dir is None or wp_probs is None:
+        return
+
+    debug_dir.mkdir(parents=True, exist_ok=True)
+    probs = wp_probs.detach().cpu().numpy()
+    fig, ax = plt.subplots(figsize=(7, 6))
+    im = ax.imshow(probs, origin="lower", cmap="viridis")
+    ax.set_xticks(range(wp_max_pad + 1))
+    ax.set_yticks(range(wp_max_pad + 1))
+    ax.set_xticklabels([str(i) for i in range(wp_max_pad + 1)])
+    ax.set_yticklabels([str(i) for i in range(wp_max_pad + 1)])
+    ax.set_xlabel("pad_right")
+    ax.set_ylabel("pad_left")
+    ax.set_title(f"WordPointer probs | step={step_idx} chunk='{text_chunk_str}'")
+    fig.colorbar(im, ax=ax, shrink=0.85)
+
+    if pred_l is not None and pred_r is not None:
+        ax.scatter([pred_r], [pred_l], s=120, facecolors="none", edgecolors="red", linewidths=2)
+        ax.text(
+            pred_r + 0.05,
+            pred_l + 0.05,
+            f"({pred_l},{pred_r})",
+            color="white",
+            fontsize=9,
+            bbox=dict(boxstyle="round,pad=0.15", fc="black", ec="none", alpha=0.5),
+        )
+
+    ax.text(
+        1.02,
+        0.02,
+        f"lookahead_end={lookahead_end}\ncommitted={committed_word_pos}",
+        transform=ax.transAxes,
+        va="bottom",
+        ha="left",
+        fontsize=9,
+        bbox=dict(boxstyle="round,pad=0.2", fc="white", ec="0.8"),
+    )
+
+    fig.tight_layout()
+    out_path = debug_dir / f"{sample_tag}_step_{step_idx:03d}_wordpointer.png"
+    fig.savefig(out_path, dpi=160)
+    plt.close(fig)
+
+
+def _save_chunk_debug_plot(
+    debug_dir: Optional[Path],
+    sample_tag: str,
+    step_idx: int,
+    model_chunk: torch.Tensor,
+    wav: torch.Tensor,
+    text_chunk_str: str,
+    sampling_rate: int,
+) -> None:
+    if debug_dir is None:
+        return
+
+    debug_dir.mkdir(parents=True, exist_ok=True)
+
+    mel = model_chunk[0].detach().cpu().numpy()
+    mel_for_display = (mel.T - mel.mean()) / (mel.std() + 1e-6)
+    mel_rms = torch.sqrt(torch.mean(torch.exp(model_chunk) ** 2, dim=-1))
+    mel_rms_np = mel_rms[0].detach().cpu().numpy()
+    wav_np = wav[0].detach().cpu().numpy()
+
+    t_mel = np.arange(mel.shape[0]) * 256 / sampling_rate
+    t_wav = np.arange(wav_np.shape[0]) / sampling_rate
+
+    fig, axes = plt.subplots(3, 1, figsize=(14, 10), sharex=False)
+    axes[0].imshow(mel_for_display, aspect="auto", origin="lower")
+    axes[0].set_title(f"Generated mel chunk | step={step_idx} | chunk='{text_chunk_str}'")
+    axes[0].set_xlabel("Frame")
+    axes[0].set_ylabel("Mel bin")
+
+    axes[1].plot(t_mel, mel_rms_np, linewidth=0.8)
+    axes[1].set_title("Generated mel RMS")
+    axes[1].set_xlabel("Time (s)")
+    axes[1].set_ylabel("RMS")
+    axes[1].grid(True, axis="y", alpha=0.2)
+
+    axes[2].plot(t_wav, wav_np, linewidth=0.8)
+    axes[2].set_title("Decoded waveform")
+    axes[2].set_xlabel("Time (s)")
+    axes[2].set_ylabel("Amplitude")
+    axes[2].grid(True, axis="y", alpha=0.2)
+
+    fig.tight_layout()
+    out_path = debug_dir / f"{sample_tag}_step_{step_idx:03d}_chunk.png"
+    fig.savefig(out_path, dpi=160)
+    plt.close(fig)
+
+
+def _save_stream_summary_plot(
+    debug_dir: Optional[Path],
+    sample_tag: str,
+    history: list,
+    total_target_words: int,
+    est_total_new_frames: int,
+) -> None:
+    if debug_dir is None or not history:
+        return
+
+    debug_dir.mkdir(parents=True, exist_ok=True)
+
+    steps = [h["step"] for h in history]
+    expected = [h["expected_word_pos"] for h in history]
+    lookahead = [h["lookahead_end"] for h in history]
+    committed = [h["committed_word_pos"] for h in history]
+    generated_frames = [h["generated_new_frames"] for h in history]
+    pred_lens = [h["pred_features_lens"] for h in history]
+    src_labels = [h["src"] for h in history]
+
+    fig, axes = plt.subplots(2, 1, figsize=(14, 9), sharex=True)
+
+    axes[0].plot(steps, expected, marker="o", label="expected")
+    axes[0].plot(steps, lookahead, marker="o", label="lookahead_end")
+    axes[0].plot(steps, committed, marker="o", label="committed")
+    axes[0].axhline(total_target_words, color="gray", linestyle="--", label="total words")
+    axes[0].set_ylabel("Word position")
+    axes[0].set_title("Streaming word progression")
+    axes[0].grid(True, alpha=0.2)
+    axes[0].legend(loc="upper left")
+
+    for step, y, src in zip(steps, committed, src_labels):
+        axes[0].text(step, y + 0.15, src, fontsize=8, ha="center")
+
+    axes[1].plot(steps, generated_frames, marker="o", label="generated frames")
+    axes[1].plot(steps, pred_lens, marker="o", label="predicted chunk len")
+    axes[1].axhline(est_total_new_frames, color="gray", linestyle="--", label="estimated total")
+    axes[1].set_xlabel("Step")
+    axes[1].set_ylabel("Frames")
+    axes[1].set_title("Frame progression")
+    axes[1].grid(True, alpha=0.2)
+    axes[1].legend(loc="upper left")
+
+    fig.tight_layout()
+    out_path = debug_dir / f"{sample_tag}_summary.png"
+    fig.savefig(out_path, dpi=160)
+    plt.close(fig)
+
+
+def trim_trailing_noise(
+    wav: torch.Tensor,
+    sampling_rate: int,
+    min_noise_ms: float = 120.0,
+    keep_ms: float = 40.0,
+) -> tuple[torch.Tensor, int]:
+    """Trim stable low-energy broadband noise from the end of a waveform.
+
+    The bad tail produced by text-starved streaming chunks is usually not
+    silence: it has low but steady RMS, high zero-crossing rate, and high
+    spectral flatness.  Work backwards from the end so normal internal
+    fricatives are left untouched.
+    """
+    if wav.numel() == 0:
+        return wav, 0
+
+    squeeze = wav.dim() == 1
+    x = wav.unsqueeze(0) if squeeze else wav
+    mono = x.mean(dim=0).detach().float().cpu()
+
+    win = max(16, int(round(0.04 * sampling_rate)))
+    hop = max(1, int(round(0.01 * sampling_rate)))
+    if mono.numel() < win * 4:
+        return wav, 0
+
+    frames = mono.unfold(0, win, hop)
+    rms = frames.pow(2).mean(dim=-1).sqrt()
+    zcr = ((frames[:, 1:] * frames[:, :-1]) < 0).float().mean(dim=-1)
+    window = torch.hann_window(win, dtype=frames.dtype)
+    spec = torch.fft.rfft(frames * window, dim=-1).abs().clamp_min(1.0e-8)
+    flatness = spec.log().mean(dim=-1).exp() / spec.mean(dim=-1).clamp_min(1.0e-8)
+
+    speech_rms_ref = rms.quantile(0.70).clamp_min(1.0e-4)
+    # Hiss tails in observed failures sit around zcr ~= 0.17 and
+    # flatness ~= 0.5, while voiced speech is much lower on both.
+    noise_like = (
+        (rms > 0.01 * speech_rms_ref)
+        & (rms < 0.75 * speech_rms_ref)
+        & (zcr > 0.11)
+        & (flatness > 0.28)
+    )
+
+    last_good = len(noise_like) - 1
+    min_frames = max(1, int(math.ceil(min_noise_ms / 10.0)))
+    count = 0
+    idx = len(noise_like) - 1
+    while idx >= 0 and bool(noise_like[idx]):
+        count += 1
+        idx -= 1
+
+    if count < min_frames:
+        return wav, 0
+
+    trim_start_frame = last_good - count + 1
+    trim_sample = trim_start_frame * hop
+    keep_samples = int(round(keep_ms * sampling_rate / 1000.0))
+    cut_sample = max(0, trim_sample - keep_samples)
+    trimmed_samples = x.size(-1) - cut_sample
+    if trimmed_samples <= 0:
+        return wav, 0
+
+    trimmed = x[..., :cut_sample]
+    if squeeze:
+        trimmed = trimmed.squeeze(0)
+    return trimmed.to(device=wav.device, dtype=wav.dtype), int(trimmed_samples)
 
 
 def get_vocoder(vocos_local_path: Optional[str] = None):
@@ -468,6 +871,15 @@ def generate_sentence(
     sampling_rate: int = 24000,
     max_duration: float = 100,
     remove_long_sil: bool = False,
+    word_pointer: Optional[torch.nn.Module] = None,
+    wp_max_pad: int = 4,
+    wp_min_frames: int = 150,
+    debug_plot_dir: Optional[Path] = None,
+    debug_plot_every: int = 1,
+    save_chunk_wavs: bool = False,
+    trim_tail_noise: bool = True,
+    tail_noise_min_ms: float = 120.0,
+    tail_noise_keep_ms: float = 40.0,
 ):
     """
     Generate waveform of a text based on a given prompt waveform and its transcription,
@@ -543,6 +955,14 @@ def generate_sentence(
         .squeeze(1)
     )
     torchaudio.save(f"{save_path}_prompt.wav", prompt_wav.cpu(), sample_rate=sampling_rate)
+    sample_tag = _safe_plot_name(Path(save_path).stem)
+    _save_prompt_debug_plot(
+        debug_dir=debug_plot_dir,
+        sample_tag=sample_tag,
+        prompt_wav=prompt_wav,
+        prompt_features=prompt_features,
+        sampling_rate=sampling_rate,
+    )
 
     rmsprompt_features = torch.sqrt(torch.mean(torch.exp(prompt_features) ** 2, dim=-1))  # shape [T]
     rmsprompt_features_np = rmsprompt_features.detach().cpu().numpy()
@@ -565,10 +985,14 @@ def generate_sentence(
     prompt_text = add_punctuation(prompt_text)
 
     # Fixed-window streaming setup.
-    fixed_chunk_frames = 30
+    fixed_chunk_frames = 150
     frame_rate = 24000 / 256
 
-    target_words = split_words(text)
+    # Use text.split() (NOT a punctuation-stripping regex) so the words
+    # passed to the WordPointer head match the trainer's tokenization
+    # (zipvoice/bin/train_word_pointer.py:151). Punctuation stays glued
+    # to its preceding word; downstream bookkeeping just counts words.
+    target_words = text.split()
     total_target_words = len(target_words)
 
     prompt_tokens_for_est = tokenizer.texts_to_token_ids([prompt_text])[0]
@@ -589,8 +1013,10 @@ def generate_sentence(
     generated_new_frames = 0
     committed_word_pos = 0
     base_prompt_text = prompt_text
+    prompt_mel_len = prompt_features.size(1)
 
     output_wav = []
+    debug_history = []
 
     if total_target_words == 0:
         logging.warning("Target text has no valid words after tokenization; skip generation.")
@@ -606,21 +1032,34 @@ def generate_sentence(
 
     num_iter = max(1, int(np.ceil(est_total_new_frames / fixed_chunk_frames)))
 
-    for i in range(num_iter):
-        # Expected synthesized position after this step.
-        expected_after_this = min(
-            est_total_new_frames,
-            generated_new_frames + fixed_chunk_frames,
-        )
-        expected_word_pos = int(
-            np.floor(total_target_words * expected_after_this / est_total_new_frames)
-        )
-        expected_word_pos = min(total_target_words, max(committed_word_pos, expected_word_pos))
+    # Words synthesized per chunk (used to project committed → expected when
+    # picking the text window for this step). It's an estimate; the next
+    # step's CTC corrects any drift via committed_word_pos.
+    words_per_chunk = max(
+        1,
+        int(np.ceil(total_target_words * fixed_chunk_frames / est_total_new_frames)),
+    )
 
-        # Send future 2 words beyond expected synthesized position.
-        lookahead_end = min(total_target_words, expected_word_pos + 3)
+    for i in range(num_iter):
+        # Expected synthesized position after this step. Pure extrapolation
+        # from committed_word_pos (= what the prompt actually covers) plus
+        # one chunk's worth of words. CTC at end-of-step will update
+        # committed_word_pos for the *next* iteration.
+        expected_word_pos = min(
+            total_target_words,
+            committed_word_pos + words_per_chunk,
+        )
+
+        logging.info(
+            f"  step {i}: committed={committed_word_pos} "
+            f"expected={expected_word_pos} (words_per_chunk={words_per_chunk})"
+        )
+
+        # Send a few words of look-ahead beyond the expected end-of-step
+        # position so cross-attention has future context.
+        lookahead_end = min(total_target_words, expected_word_pos + 2)
         if lookahead_end <= committed_word_pos:
-            lookahead_end = min(total_target_words, committed_word_pos + 3)
+            lookahead_end = min(total_target_words, committed_word_pos + 2)
 
         text_chunk_words = target_words[committed_word_pos:lookahead_end]
         if len(text_chunk_words) == 0:
@@ -633,7 +1072,7 @@ def generate_sentence(
         )
         # Tokenize text (str tokens), punctuations will be preserved.
         tokens_str = tokenizer.texts_to_tokens([text_chunk_str])[0]
-        prompt_tokens_str = tokenizer.texts_to_tokens([prompt_text])[0]
+        prompt_tokens_str = tokenizer.texts_to_tokens([prompt_text + " "])[0]
 
         chunked_tokens_str = chunk_tokens_punctuation(tokens_str, max_tokens=1000)
         # Tokenize text (int tokens)
@@ -665,7 +1104,8 @@ def generate_sentence(
         )
         print(f"pred_features:{pred_features}")
 
-        model_chunk = pred_features[:, : pred_features_lens, :]
+        pred_features_lens_int = _to_int(pred_features_lens)
+        model_chunk = pred_features[:, : pred_features_lens_int, :]
         actual_chunk_frames = min(fixed_chunk_frames, model_chunk.size(1))
         model_chunk = model_chunk[:, :actual_chunk_frames, :]
         if actual_chunk_frames < fixed_chunk_frames:
@@ -696,23 +1136,178 @@ def generate_sentence(
         if prompt_rms < target_rms:
             wav = wav * prompt_rms / target_rms
         print(f"wav rms: {torch.sqrt(torch.mean(wav**2))} wav:{wav}")
-        torchaudio.save(f"{save_path}_chunk_{i:03d}_{text_chunk_str}.wav", wav.cpu(), sample_rate=sampling_rate)
+        if save_chunk_wavs:
+            chunk_name = _safe_plot_name(text_chunk_str, max_len=120)
+            torchaudio.save(
+                f"{save_path}_chunk_{i:03d}_{chunk_name}.wav",
+                wav.cpu(),
+                sample_rate=sampling_rate,
+            )
         output_wav.append(wav)
 
         # Finish model generation
         t = (dt.datetime.now() - start_t).total_seconds()
         generated_new_frames += fixed_chunk_frames
-        committed_word_pos = expected_word_pos
+        prompt_features = torch.cat([prompt_features, model_chunk], dim=1)
+
+        # End-of-step word-pointer decision: feed the most recent
+        # ``wp_min_frames`` frames of generated mel together with this
+        # step's text window into WordPointer. It predicts
+        # ``(pred_left, pred_right)`` = (#words in the window already
+        # past, #words at the right not yet spoken). We commit
+        # ``lookahead_end - pred_right`` and fall back to the duration
+        # ratio for the very first step (not enough mel yet).
+        wp_pred = None
+        wp_info = None
+        wp_tokens_ids = []
+        wp_mel = wp_mel_lens = wp_tokens = wp_token_lens = None
+        gen_mel_full = prompt_features[:, prompt_mel_len:, :]
+        gen_mel_len = gen_mel_full.size(1)
+        if word_pointer is not None and gen_mel_len >= wp_min_frames:
+            wp_device = next(word_pointer.parameters()).device
+            wp_mel = gen_mel_full[:, -wp_min_frames:, :].to(wp_device)
+            wp_tokens_ids = tokenizer.texts_to_token_ids([text_chunk_str])[0]
+            if len(wp_tokens_ids) > 0:
+                wp_mel_lens = torch.tensor(
+                    [wp_min_frames], dtype=torch.long, device=wp_device
+                )
+                wp_tokens = torch.tensor(
+                    [wp_tokens_ids], dtype=torch.long, device=wp_device
+                )
+                wp_token_lens = torch.tensor(
+                    [len(wp_tokens_ids)], dtype=torch.long, device=wp_device
+                )
+                with torch.inference_mode():
+                    logits = word_pointer(wp_mel, wp_mel_lens, wp_tokens, wp_token_lens)
+                label = int(logits.argmax(dim=-1).item())
+                pred_l, pred_r = WordPointer.decode_label(label, max_pad=wp_max_pad)
+                wp_pred = (pred_l, pred_r)
+                wp_info = {"label": label, "pred_left": pred_l, "pred_right": pred_r}
+
+        if wp_pred is not None:
+            _, pred_r = wp_pred
+            wp_word_pos = lookahead_end - pred_r
+            committed_word_pos = min(
+                total_target_words,
+                max(committed_word_pos, wp_word_pos),
+            )
+            src = "wp"
+        else:
+            # Ratio fallback: extrapolate from frames synthesized so far.
+            ratio_pos = int(
+                np.floor(total_target_words * generated_new_frames / est_total_new_frames)
+            )
+            committed_word_pos = min(
+                total_target_words,
+                max(committed_word_pos, ratio_pos),
+            )
+            src = "ratio"
+
+        debug_history.append(
+            {
+                "step": i,
+                "expected_word_pos": expected_word_pos,
+                "lookahead_end": lookahead_end,
+                "committed_word_pos": committed_word_pos,
+                "generated_new_frames": generated_new_frames,
+                "pred_features_lens": pred_features_lens_int,
+                "actual_chunk_frames": actual_chunk_frames,
+                "src": src,
+            }
+        )
+
+        if debug_plot_dir is not None and (i % max(1, debug_plot_every) == 0):
+            wp_probs = None
+            pred_l = pred_r = None
+            if (
+                word_pointer is not None
+                and gen_mel_len >= wp_min_frames
+                and len(wp_tokens_ids) > 0
+                and wp_mel is not None
+            ):
+                with torch.inference_mode():
+                    logits_for_plot = word_pointer(wp_mel, wp_mel_lens, wp_tokens, wp_token_lens)
+                    wp_probs = torch.softmax(logits_for_plot[0], dim=-1).reshape(wp_max_pad + 1, wp_max_pad + 1)
+                if wp_pred is not None:
+                    pred_l, pred_r = wp_pred
+            _save_stream_debug_plot(
+                debug_dir=debug_plot_dir,
+                sample_tag=sample_tag,
+                step_idx=i,
+                target_words=target_words,
+                text_chunk_str=text_chunk_str,
+                expected_word_pos=expected_word_pos,
+                lookahead_end=lookahead_end,
+                committed_word_pos=committed_word_pos,
+                generated_new_frames=generated_new_frames,
+                est_total_new_frames=est_total_new_frames,
+                fixed_chunk_frames=fixed_chunk_frames,
+                pred_features_lens=pred_features_lens_int,
+                actual_chunk_frames=actual_chunk_frames,
+                src=src,
+            )
+            _save_word_pointer_heatmap(
+                debug_dir=debug_plot_dir,
+                sample_tag=sample_tag,
+                step_idx=i,
+                wp_probs=wp_probs,
+                wp_max_pad=wp_max_pad,
+                pred_l=pred_l,
+                pred_r=pred_r,
+                lookahead_end=lookahead_end,
+                committed_word_pos=committed_word_pos,
+                text_chunk_str=text_chunk_str,
+            )
+            _save_chunk_debug_plot(
+                debug_dir=debug_plot_dir,
+                sample_tag=sample_tag,
+                step_idx=i,
+                model_chunk=model_chunk,
+                wav=wav,
+                text_chunk_str=text_chunk_str,
+                sampling_rate=sampling_rate,
+            )
+
+        if wp_info is not None:
+            logging.info(
+                f"  step {i} end: src={src} committed={committed_word_pos} "
+                f"lookahead_end={lookahead_end} "
+                f"pred_left={wp_info['pred_left']} pred_right={wp_info['pred_right']} "
+                f"label={wp_info['label']}"
+            )
+        else:
+            logging.info(
+                f"  step {i} end: src={src} committed={committed_word_pos} (WP skipped)"
+            )
+
         prompt_text = (
             base_prompt_text + " " + " ".join(target_words[:committed_word_pos])
         ).strip()
-        prompt_features = torch.cat([prompt_features, model_chunk], dim=1)
 
         # Stop when all words are expected to be synthesized.
         if committed_word_pos >= total_target_words and generated_new_frames >= est_total_new_frames:
             break
 
     final_wav = torch.cat(output_wav, dim=-1)
+    if trim_tail_noise:
+        final_wav, trimmed_samples = trim_trailing_noise(
+            final_wav,
+            sampling_rate=sampling_rate,
+            min_noise_ms=tail_noise_min_ms,
+            keep_ms=tail_noise_keep_ms,
+        )
+        if trimmed_samples > 0:
+            logging.info(
+                "Trimmed trailing broadband noise: %.3fs",
+                trimmed_samples / sampling_rate,
+            )
+    _save_stream_summary_plot(
+        debug_dir=debug_plot_dir,
+        sample_tag=sample_tag,
+        history=debug_history,
+        total_target_words=total_target_words,
+        est_total_new_frames=est_total_new_frames,
+    )
     print(f"Final generated wav duration: {final_wav.shape[-1] / sampling_rate}s")
     # Calculate processing time metrics
     t_no_vocoder = (start_vocoder_t - start_t).total_seconds()
@@ -731,7 +1326,9 @@ def generate_sentence(
         "rtf_vocoder": rtf_vocoder,
     }
 
-    torchaudio.save(save_path + "_" + prompt_text + ".wav", final_wav.cpu(), sample_rate=sampling_rate)
+    safe_prompt = re.sub(r"[^A-Za-z0-9._-]", "_", prompt_text)[:80]
+    torchaudio.save(save_path, final_wav.cpu(), sample_rate=sampling_rate)
+    # torchaudio.save(save_path + "_" + safe_prompt + ".wav", final_wav.cpu(), sample_rate=sampling_rate)
     return metrics
 
 
@@ -753,6 +1350,15 @@ def generate_list(
     raw_evaluation: bool = False,
     max_duration: float = 100,
     remove_long_sil: bool = False,
+    word_pointer: Optional[torch.nn.Module] = None,
+    wp_max_pad: int = 4,
+    wp_min_frames: int = 150,
+    debug_plot_dir: Optional[Path] = None,
+    debug_plot_every: int = 1,
+    save_chunk_wavs: bool = False,
+    trim_tail_noise: bool = True,
+    tail_noise_min_ms: float = 120.0,
+    tail_noise_keep_ms: float = 40.0,
 ):
     total_t = []
     total_t_no_vocoder = []
@@ -792,6 +1398,15 @@ def generate_list(
                 **common_params,
                 max_duration=max_duration,
                 remove_long_sil=remove_long_sil,
+                word_pointer=word_pointer,
+                wp_max_pad=wp_max_pad,
+                wp_min_frames=wp_min_frames,
+                debug_plot_dir=debug_plot_dir,
+                debug_plot_every=debug_plot_every,
+                save_chunk_wavs=save_chunk_wavs,
+                trim_tail_noise=trim_tail_noise,
+                tail_noise_min_ms=tail_noise_min_ms,
+                tail_noise_keep_ms=tail_noise_keep_ms,
             )
         logging.info(f"[Sentence: {i}] Saved to: {save_path}")
         logging.info(f"[Sentence: {i}] RTF: {metrics['rtf']:.4f}")
@@ -905,7 +1520,7 @@ def main():
     if str(model_ckpt).endswith(".safetensors"):
         safetensors.torch.load_model(model, model_ckpt)
     elif str(model_ckpt).endswith(".pt"):
-        load_checkpoint(filename=model_ckpt, model=model, strict=True)
+        load_checkpoint(filename=model_ckpt, model=model, strict=False)
     else:
         raise NotImplementedError(f"Unsupported model checkpoint format: {model_ckpt}")
 
@@ -922,6 +1537,41 @@ def main():
 
     if params.trt_engine_path:
         load_trt(model, params.trt_engine_path)
+
+    assert params.word_pointer_ckpt is not None, (
+        "Streaming inference requires --word-pointer-ckpt PATH."
+    )
+    logging.info(f"Loading WordPointer from {params.word_pointer_ckpt}")
+    wp_ckpt = torch.load(
+        params.word_pointer_ckpt, map_location="cpu", weights_only=False
+    )
+    wp_vocab_size = int(wp_ckpt.get("vocab_size", tokenizer.vocab_size))
+    wp_params = wp_ckpt.get("params", {}) or {}
+    wp_max_pad = int(wp_ckpt.get("max_pad", wp_params.get("max_pad", params.word_pointer_max_pad)))
+    assert wp_max_pad == params.word_pointer_max_pad, (
+        f"--word-pointer-max-pad={params.word_pointer_max_pad} disagrees with "
+        f"checkpoint's max_pad={wp_max_pad}; pass the matching value."
+    )
+    wp_chunk_frames = int(wp_ckpt.get("chunk_frames", wp_params.get("chunk_frames", 150)))
+    word_pointer = WordPointer(
+        vocab_size=wp_vocab_size,
+        max_pad=wp_max_pad,
+        mel_in_dim=int(model_config["model"].get("feat_dim", 100)),
+        dim=int(wp_params.get("dim", 128)),
+        mel_encoder_layers=int(wp_params.get("mel_encoder_layers", 2)),
+        text_encoder_layers=int(wp_params.get("text_encoder_layers", 2)),
+        cross_attn_layers=int(wp_params.get("cross_attn_layers", 2)),
+        num_heads=int(wp_params.get("num_heads", 4)),
+        feedforward_dim=int(wp_params.get("feedforward_dim", 512)),
+        dropout=float(wp_params.get("dropout", 0.0)),
+    )
+    word_pointer.load_state_dict(wp_ckpt["model"])
+    word_pointer = word_pointer.to(params.device).eval()
+    logging.info(
+        f"WordPointer: vocab_size={wp_vocab_size} max_pad={wp_max_pad} "
+        f"chunk_frames={wp_chunk_frames} "
+        f"params={sum(p.numel() for p in word_pointer.parameters())}"
+    )
 
     vocoder = get_vocoder(params.vocoder_path)
     vocoder = vocoder.to(params.device)
@@ -957,6 +1607,15 @@ def main():
             raw_evaluation=params.raw_evaluation,
             max_duration=params.max_duration,
             remove_long_sil=params.remove_long_sil,
+            word_pointer=word_pointer,
+            wp_max_pad=wp_max_pad,
+            wp_min_frames=params.word_pointer_min_frames,
+            debug_plot_dir=params.debug_plot_dir,
+            debug_plot_every=params.debug_plot_every,
+            save_chunk_wavs=params.save_chunk_wavs,
+            trim_tail_noise=params.trim_tail_noise,
+            tail_noise_min_ms=params.tail_noise_min_ms,
+            tail_noise_keep_ms=params.tail_noise_keep_ms,
         )
     else:
         assert (
@@ -981,6 +1640,15 @@ def main():
             sampling_rate=params.sampling_rate,
             max_duration=params.max_duration,
             remove_long_sil=params.remove_long_sil,
+            word_pointer=word_pointer,
+            wp_max_pad=wp_max_pad,
+            wp_min_frames=params.word_pointer_min_frames,
+            debug_plot_dir=params.debug_plot_dir,
+            debug_plot_every=params.debug_plot_every,
+            save_chunk_wavs=params.save_chunk_wavs,
+            trim_tail_noise=params.trim_tail_noise,
+            tail_noise_min_ms=params.tail_noise_min_ms,
+            tail_noise_keep_ms=params.tail_noise_keep_ms,
         )
         logging.info(f"Saved to: {params.res_wav_path}")
     logging.info("Done")
