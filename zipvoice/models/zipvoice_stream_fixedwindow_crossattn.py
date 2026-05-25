@@ -364,7 +364,10 @@ class ZipVoice(nn.Module):
         if alignments is not None and id2textDict is None:
             raise ValueError("id2textDict cannot be None when alignments is provided.")
 
-        # 固定窗长目标：随机选 10 帧作为预测区域，并将该窗口之后的特征全部置 0。
+        # 固定窗长目标：随机选 150 帧作为预测区域，并将该窗口之后的特征全部置 0。
+        # 允许窗口越过 utterance 尾部；loss_mask 会和 padding_mask 相与，
+        # 因此只在真实存在的帧上计算 loss。这让训练覆盖推理时最后一个
+        # chunk 真实音频不足 150 帧的场景。
         for i, feat_len in enumerate(features_lens):
             feat_len_int = int(feat_len.item())
 
@@ -373,9 +376,11 @@ class ZipVoice(nn.Module):
                 mask_end = 0
             elif feat_len_int <= window_size:
                 mask_start = 0
-                mask_end = feat_len_int
+                mask_end = window_size
             else:
-                mask_start = random.randint(0, feat_len_int - window_size)
+                min_valid_frames = min(30, feat_len_int)
+                latest_start = max(0, feat_len_int - min_valid_frames)
+                mask_start = random.randint(0, latest_start)
                 mask_end = mask_start + window_size
 
             mask_starts_list.append(mask_start)
@@ -780,15 +785,15 @@ class ZipVoice(nn.Module):
 
         # _, posemb_condition = self.posemb(text_condition, num_frames - padding_mask.sum(dim=1))
 
-        print(f"shape of prompt_features:{prompt_features.shape} num_frames={num_frames} ")
+        # print(f"shape of prompt_features:{prompt_features.shape} num_frames={num_frames} ")
         speech_condition = torch.nn.functional.pad(
             prompt_features, (0, 0, 0, num_frames - prompt_features.size(1))
         )  # (B, T, F)
-        print(f"shape of speech_condition:{speech_condition.shape} shape of prompt_features:{prompt_features.shape} ")
+        # print(f"shape of speech_condition:{speech_condition.shape} shape of prompt_features:{prompt_features.shape} ")
 
         # False means speech condition positions.
         speech_condition_mask = make_pad_mask(prompt_features_lens, num_frames)
-        print(f"shape of speech_condition:{speech_condition.shape} shape of speech_condition_mask:{speech_condition_mask.shape} ")
+        # print(f"shape of speech_condition:{speech_condition.shape} shape of speech_condition_mask:{speech_condition_mask.shape} ")
         speech_condition = torch.where(
             speech_condition_mask.unsqueeze(-1),
             torch.zeros_like(speech_condition),

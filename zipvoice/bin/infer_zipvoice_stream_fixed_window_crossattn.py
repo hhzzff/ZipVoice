@@ -920,6 +920,7 @@ def generate_sentence(
             factor metrics for processing.
     """
 
+    start_t = dt.datetime.now()
     # Load and process prompt wav
     prompt_wav = load_prompt_wav(prompt_wav, sampling_rate=sampling_rate)
 
@@ -982,6 +983,8 @@ def generate_sentence(
 
     # Add punctuation in the end if there is not
     text = add_punctuation(text)
+    text = text[:-1] + "___."
+    print(f"text:{text}")
     prompt_text = add_punctuation(prompt_text)
 
     # Fixed-window streaming setup.
@@ -1030,7 +1033,7 @@ def generate_sentence(
             "rtf_vocoder": 0.0,
         }
 
-    num_iter = max(1, int(np.ceil(est_total_new_frames / fixed_chunk_frames)))
+    num_iter = max(1, int(np.ceil(est_total_new_frames / fixed_chunk_frames))) + 1
 
     # Words synthesized per chunk (used to project committed → expected when
     # picking the text window for this step). It's an estimate; the next
@@ -1047,8 +1050,9 @@ def generate_sentence(
         # committed_word_pos for the *next* iteration.
         expected_word_pos = min(
             total_target_words,
-            committed_word_pos + words_per_chunk,
+            committed_word_pos + words_per_chunk + 1,
         )
+        print(f"expected_word_pos:{expected_word_pos} total_target_words:{total_target_words} committed_word_pos:{committed_word_pos}")
 
         logging.info(
             f"  step {i}: committed={committed_word_pos} "
@@ -1080,11 +1084,10 @@ def generate_sentence(
         prompt_tokens = tokenizer.tokens_to_token_ids([prompt_tokens_str])
 
         # Start predicting features
-        start_t = dt.datetime.now()
 
 
 
-        print(f"tokens:{tokens} prompt_tokens:{prompt_tokens} shape of prompt_features: {prompt_features.shape}")
+        # print(f"tokens:{tokens} prompt_tokens:{prompt_tokens} shape of prompt_features: {prompt_features.shape}")
         # Generate features
         (
             pred_features,
@@ -1102,7 +1105,7 @@ def generate_sentence(
             num_step=num_step,
             guidance_scale=guidance_scale,
         )
-        print(f"pred_features:{pred_features}")
+        # print(f"pred_features:{pred_features}")
 
         pred_features_lens_int = _to_int(pred_features_lens)
         model_chunk = pred_features[:, : pred_features_lens_int, :]
@@ -1119,7 +1122,7 @@ def generate_sentence(
 
         # Start vocoder processing
         start_vocoder_t = dt.datetime.now()
-        print(f"shape of pred_features: {pred_features.shape}, pred_features_lens: {pred_features_lens}, pred_features[0, :5, 0]: {pred_features[0, :5, 0]}")
+        # print(f"shape of pred_features: {pred_features.shape}, pred_features_lens: {pred_features_lens}, pred_features[0, :5, 0]: {pred_features[0, :5, 0]}")
         wav = (
             vocoder.decode(pred_features)
             .squeeze(1)
@@ -1186,7 +1189,7 @@ def generate_sentence(
 
         if wp_pred is not None:
             _, pred_r = wp_pred
-            wp_word_pos = lookahead_end - pred_r
+            wp_word_pos = lookahead_end - pred_r - 1
             committed_word_pos = min(
                 total_target_words,
                 max(committed_word_pos, wp_word_pos),
@@ -1285,7 +1288,7 @@ def generate_sentence(
         ).strip()
 
         # Stop when all words are expected to be synthesized.
-        if committed_word_pos >= total_target_words and generated_new_frames >= est_total_new_frames:
+        if committed_word_pos >= total_target_words - 1:# and generated_new_frames >= est_total_new_frames:
             break
 
     final_wav = torch.cat(output_wav, dim=-1)
