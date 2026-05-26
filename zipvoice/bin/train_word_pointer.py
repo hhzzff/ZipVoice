@@ -63,6 +63,9 @@ def get_parser():
                         help="Optional ZipVoice JSON (only used to read feat_dim).")
     parser.add_argument("--pretrained-ckpt", type=Path, default=None,
                         help="Optional warm-start ckpt loaded with strict=False.")
+    parser.add_argument("--resume-word-pointer-ckpt", type=Path, default=None,
+                        help="Resume/fine-tune from a saved word_pointer.pt. "
+                             "This loads ckpt['model'] with strict=True.")
     parser.add_argument("--feat-scale", type=float, default=0.1)
     parser.add_argument("--chunk-frames", type=int, default=150,
                         help="Length of the mel chunk fed to the pointer.")
@@ -79,6 +82,9 @@ def get_parser():
     parser.add_argument("--dropout", type=float, default=0.1)
     parser.add_argument("--steps", type=int, default=10000)
     parser.add_argument("--lr", type=float, default=5e-4)
+    parser.add_argument("--min-lr-ratio", type=float, default=0.0,
+                        help="Cosine LR floor as a ratio of --lr. 0.1 keeps "
+                             "the final LR at 10%% of the base LR.")
     parser.add_argument("--weight-decay", type=float, default=1e-2)
     parser.add_argument("--clip-grad-norm", type=float, default=5.0)
     parser.add_argument("--eval-every", type=int, default=500)
@@ -109,6 +115,16 @@ def get_parser():
                         help="Minimum noise std multiplier relative to sample std.")
     parser.add_argument("--noise-std-max", type=float, default=0.03,
                         help="Maximum noise std multiplier relative to sample std.")
+    parser.add_argument("--pause-augment-prob", type=float, default=0.0,
+                        help="Probability of expanding an inter-word pause inside "
+                             "the sampled pointer chunk and then cropping back.")
+    parser.add_argument("--pause-extra-min-frames", type=int, default=8,
+                        help="Minimum frames inserted by pause augmentation.")
+    parser.add_argument("--pause-extra-max-frames", type=int, default=40,
+                        help="Maximum frames inserted by pause augmentation.")
+    parser.add_argument("--pause-min-gap-frames", type=int, default=2,
+                        help="Minimum inter-word gap, in frames, eligible for "
+                             "pause augmentation.")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--eval-seed", type=int, default=20260507)
     parser.add_argument("--log-interval", type=int, default=20)
@@ -139,6 +155,68 @@ def _word_start_dur(w) -> Tuple[float, float]:
     return float(getattr(w, "start", 0.0)), float(getattr(w, "duration", 0.0))
 
 
+def _expand_pause_and_crop(
+    chunk: torch.Tensor,
+    word_starts: List[float],
+    word_ends: List[float],
+    chunk_start: int,
+    chunk_frames: int,
+    rng: random.Random,
+    extra_min_frames: int,
+    extra_max_frames: int,
+    min_gap_frames: int,
+) -> Tuple[torch.Tensor, List[float], int, int]:
+    """Expand one inter-word pause inside a chunk and crop back to fixed length.
+
+    Returns the augmented chunk, shifted word midpoints in the cropped chunk's
+    coordinate space, the augmented crop start, and the inserted frame count.
+    """
+    candidates = []
+    for i in range(len(word_starts) - 1):
+        gap_start = word_ends[i]
+        gap_end = word_starts[i + 1]
+        gap_len = int(round(gap_end - gap_start))
+        if gap_len < min_gap_frames:
+            continue
+        if gap_start < chunk_start or gap_end >= chunk_start + chunk_frames:
+            continue
+        candidates.append((int(round(gap_start - chunk_start)), i))
+
+    if not candidates:
+        mids = [
+            (s + e) / 2.0 - chunk_start
+            for s, e in zip(word_starts, word_ends)
+        ]
+        return chunk, mids, 0, 0
+
+    insert_pos, _ = rng.choice(candidates)
+    extra_frames = rng.randint(extra_min_frames, extra_max_frames)
+    extra_frames = max(1, extra_frames)
+
+    pad_frame = chunk[insert_pos - 1 : insert_pos] if insert_pos > 0 else chunk[:1]
+    aug = torch.cat(
+        [
+            chunk[:insert_pos],
+            pad_frame.expand(extra_frames, -1),
+            chunk[insert_pos:],
+        ],
+        dim=0,
+    )
+
+    max_crop_start = aug.size(0) - chunk_frames
+    crop_start = rng.randint(0, max_crop_start)
+    aug_chunk = aug[crop_start : crop_start + chunk_frames, :]
+
+    mids = []
+    for s, e in zip(word_starts, word_ends):
+        mid = (s + e) / 2.0 - chunk_start
+        if mid >= insert_pos:
+            mid += extra_frames
+        mids.append(mid - crop_start)
+
+    return aug_chunk, mids, crop_start, extra_frames
+
+
 def build_pointer_batch(
     batch,
     tokenizer: LibriTTSTokenizer,
@@ -146,6 +224,10 @@ def build_pointer_batch(
     chunk_frames: int,
     rng: random.Random,
     pad_id: int,
+    pause_augment_prob: float = 0.0,
+    pause_extra_min_frames: int = 8,
+    pause_extra_max_frames: int = 40,
+    pause_min_gap_frames: int = 2,
     return_debug: bool = False,
 ) -> Optional[Dict[str, torch.Tensor]]:
     """Convert a TTS dataloader batch into a WordPointer training batch.
@@ -165,6 +247,13 @@ def build_pointer_batch(
     debug_items: List[Dict] = []
 
     n_classes = (max_pad + 1) ** 2
+
+    def _covered_word_range(mids: List[float], start: float, end: float):
+        covered = [k for k, m in enumerate(mids) if start <= m < end]
+        if covered:
+            return covered[0], covered[-1] + 1
+        split = sum(1 for m in mids if m < end)
+        return split, split
 
     for i in range(features.size(0)):
         T_mel = int(features_lens[i].item())
@@ -187,20 +276,47 @@ def build_pointer_batch(
         words_ali = words_ali[:n_words]
 
         mids = []
+        word_starts = []
+        word_ends = []
         for w in words_ali:
             ws, wd = _word_start_dur(w)
-            mids.append((ws + wd / 2.0) * FRAMES_PER_SECOND)
+            start_frame = ws * FRAMES_PER_SECOND
+            end_frame = (ws + wd) * FRAMES_PER_SECOND
+            word_starts.append(start_frame)
+            word_ends.append(end_frame)
+            mids.append((start_frame + end_frame) / 2.0)
 
         t0 = rng.randint(0, T_mel - chunk_frames)
         t1 = t0 + chunk_frames
+        mel_chunk = features[i, t0:t1, :]
+        pause_augmented = False
+        pause_crop_start = 0
+        pause_extra_frames = 0
 
-        covered = [k for k, m in enumerate(mids) if t0 <= m < t1]
-        if covered:
-            w_lo = covered[0]
-            w_hi = covered[-1] + 1
+        if pause_augment_prob > 0.0 and rng.random() < pause_augment_prob:
+            (
+                mel_chunk,
+                local_mids,
+                pause_crop_start,
+                pause_extra_frames,
+            ) = _expand_pause_and_crop(
+                chunk=mel_chunk,
+                word_starts=word_starts,
+                word_ends=word_ends,
+                chunk_start=t0,
+                chunk_frames=chunk_frames,
+                rng=rng,
+                extra_min_frames=pause_extra_min_frames,
+                extra_max_frames=pause_extra_max_frames,
+                min_gap_frames=pause_min_gap_frames,
+            )
+            pause_augmented = pause_extra_frames > 0
+            w_lo, w_hi = _covered_word_range(local_mids, 0, chunk_frames)
         else:
-            split = sum(1 for m in mids if m < t1)
-            w_lo = w_hi = split
+            w_lo, w_hi = _covered_word_range(mids, t0, t1)
+
+        w_lo = max(0, min(n_words, w_lo))
+        w_hi = max(w_lo, min(n_words, w_hi))
 
         req_l = rng.randint(0, max_pad)
         req_r = rng.randint(0, max_pad)
@@ -218,7 +334,7 @@ def build_pointer_batch(
         if not token_ids:
             continue
 
-        out_mel.append(features[i, t0:t1, :])
+        out_mel.append(mel_chunk)
         out_mel_lens.append(chunk_frames)
         out_tokens.append(token_ids)
         out_token_lens.append(len(token_ids))
@@ -242,6 +358,9 @@ def build_pointer_batch(
                     "covered_words": " ".join(target_words[w_lo:w_hi]),
                     "selected_words": " ".join(target_words[sel_lo:sel_hi]),
                     "token_len": len(token_ids),
+                    "pause_augmented": pause_augmented,
+                    "pause_crop_start": pause_crop_start,
+                    "pause_extra_frames": pause_extra_frames,
                 }
             )
 
@@ -356,7 +475,12 @@ def evaluate(
         if b_idx >= max_batches:
             break
         pb = build_pointer_batch(
-            batch, tokenizer, params.max_pad, params.chunk_frames, rng, model.pad_id
+            batch,
+            tokenizer,
+            params.max_pad,
+            params.chunk_frames,
+            rng,
+            model.pad_id,
         )
         if pb is None:
             continue
@@ -502,10 +626,17 @@ def log_tb_samples(
 # ---------------------------------------------------------------------------
 
 
-def cosine_lr(step: int, total_steps: int, base_lr: float) -> float:
+def cosine_lr(
+    step: int,
+    total_steps: int,
+    base_lr: float,
+    min_lr_ratio: float = 0.0,
+) -> float:
     if total_steps <= 0:
         return base_lr
-    return 0.5 * base_lr * (1.0 + math.cos(math.pi * step / total_steps))
+    min_lr = base_lr * min_lr_ratio
+    cosine = 0.5 * (1.0 + math.cos(math.pi * step / total_steps))
+    return min_lr + (base_lr - min_lr) * cosine
 
 
 def remove_short_and_long_utt(c: Cut, min_len: float, max_len: float) -> bool:
@@ -578,6 +709,32 @@ def main() -> None:
         logging.info(f"Warm-starting from {params.pretrained_ckpt} (strict=False)")
         load_checkpoint(filename=params.pretrained_ckpt, model=model, strict=False)
 
+    if params.resume_word_pointer_ckpt is not None:
+        logging.info(
+            f"Resuming WordPointer weights from {params.resume_word_pointer_ckpt}"
+        )
+        wp_ckpt = torch.load(
+            params.resume_word_pointer_ckpt,
+            map_location="cpu",
+            weights_only=False,
+        )
+        ckpt_max_pad = int(wp_ckpt.get("max_pad", params.max_pad))
+        ckpt_chunk_frames = int(wp_ckpt.get("chunk_frames", params.chunk_frames))
+        ckpt_vocab_size = int(wp_ckpt.get("vocab_size", vocab_size))
+        assert ckpt_max_pad == params.max_pad, (
+            f"--max-pad={params.max_pad} disagrees with checkpoint "
+            f"max_pad={ckpt_max_pad}"
+        )
+        assert ckpt_chunk_frames == params.chunk_frames, (
+            f"--chunk-frames={params.chunk_frames} disagrees with checkpoint "
+            f"chunk_frames={ckpt_chunk_frames}"
+        )
+        assert ckpt_vocab_size == vocab_size, (
+            f"token vocab_size={vocab_size} disagrees with checkpoint "
+            f"vocab_size={ckpt_vocab_size}"
+        )
+        model.load_state_dict(wp_ckpt["model"], strict=True)
+
     optimizer = torch.optim.AdamW(
         model.parameters(), lr=params.lr, weight_decay=params.weight_decay
     )
@@ -623,7 +780,16 @@ def main() -> None:
             batch = next(train_iter)
 
         pb = build_pointer_batch(
-            batch, tokenizer, params.max_pad, params.chunk_frames, train_rng, model.pad_id
+            batch,
+            tokenizer,
+            params.max_pad,
+            params.chunk_frames,
+            train_rng,
+            model.pad_id,
+            pause_augment_prob=params.pause_augment_prob,
+            pause_extra_min_frames=params.pause_extra_min_frames,
+            pause_extra_max_frames=params.pause_extra_max_frames,
+            pause_min_gap_frames=params.pause_min_gap_frames,
         )
         if pb is None:
             step += 1
@@ -642,7 +808,12 @@ def main() -> None:
         loss = F.cross_entropy(logits, labels)
 
         for g in optimizer.param_groups:
-            g["lr"] = cosine_lr(step, params.steps, params.lr)
+            g["lr"] = cosine_lr(
+                step,
+                params.steps,
+                params.lr,
+                min_lr_ratio=params.min_lr_ratio,
+            )
         optimizer.zero_grad()
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=params.clip_grad_norm)

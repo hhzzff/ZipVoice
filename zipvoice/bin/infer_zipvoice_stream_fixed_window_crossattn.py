@@ -1052,9 +1052,9 @@ def generate_sentence(
 
         # Send a few words of look-ahead beyond the expected end-of-step
         # position so cross-attention has future context.
-        lookahead_end = min(total_target_words, expected_word_pos + 2)
+        lookahead_end = min(total_target_words, expected_word_pos + 3)
         if lookahead_end <= committed_word_pos:
-            lookahead_end = min(total_target_words, committed_word_pos + 2)
+            lookahead_end = min(total_target_words, committed_word_pos + 3)
 
         text_chunk_words = target_words[committed_word_pos:lookahead_end]
         if len(text_chunk_words) == 0:
@@ -1182,12 +1182,12 @@ def generate_sentence(
                 wp_decision = "argmax"
                 fallback_l = 1
                 fallback_min_prob = 0.05
-                if wp_conf < 0.7 and fallback_l <= wp_max_pad:
+                if (wp_conf < 0.7 and fallback_l <= wp_max_pad) or wp_conf < 0.4:
                     n_pad = wp_max_pad + 1
                     row_start = fallback_l * n_pad
                     row_probs = probs[row_start : row_start + n_pad]
                     row_best_prob, row_best_r = row_probs.max(dim=-1)
-                    if float(row_best_prob.item()) > fallback_min_prob:
+                    if float(row_best_prob.item()) > fallback_min_prob or wp_conf < 0.4:
                         pred_l = fallback_l
                         pred_r = int(row_best_r.item())
                         label = row_start + pred_r
