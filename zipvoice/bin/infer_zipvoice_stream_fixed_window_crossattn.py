@@ -639,61 +639,51 @@ def _save_stream_summary_plot(
 
 def trim_trailing_noise(
     wav: torch.Tensor,
+    mel: torch.Tensor,
     sampling_rate: int,
-    min_noise_ms: float = 120.0,
-    keep_ms: float = 40.0,
+    min_noise_ms: float = 20.0,
+    rms_tol: float = 1.0e-4,
 ) -> tuple[torch.Tensor, int]:
-    """Trim stable low-energy broadband noise from the end of a waveform.
+    """Trim from the first generated-mel RMS=1 plateau onward.
 
-    The bad tail produced by text-starved streaming chunks is usually not
-    silence: it has low but steady RMS, high zero-crossing rate, and high
-    spectral flatness.  Work backwards from the end so normal internal
-    fricatives are left untouched.
+    Padded all-zero mel frames have ``sqrt(mean(exp(0)^2)) == 1`` and decode
+    to a deterministic noise tail. Scan forward and cut the waveform at the
+    first sufficiently long RMS=1 plateau.
     """
-    if wav.numel() == 0:
+    if wav.numel() == 0 or mel.numel() == 0:
         return wav, 0
 
     squeeze = wav.dim() == 1
     x = wav.unsqueeze(0) if squeeze else wav
-    mono = x.mean(dim=0).detach().float().cpu()
 
-    win = max(16, int(round(0.04 * sampling_rate)))
-    hop = max(1, int(round(0.01 * sampling_rate)))
-    if mono.numel() < win * 4:
-        return wav, 0
-
-    frames = mono.unfold(0, win, hop)
-    rms = frames.pow(2).mean(dim=-1).sqrt()
-    zcr = ((frames[:, 1:] * frames[:, :-1]) < 0).float().mean(dim=-1)
-    window = torch.hann_window(win, dtype=frames.dtype)
-    spec = torch.fft.rfft(frames * window, dim=-1).abs().clamp_min(1.0e-8)
-    flatness = spec.log().mean(dim=-1).exp() / spec.mean(dim=-1).clamp_min(1.0e-8)
-
-    speech_rms_ref = rms.quantile(0.70).clamp_min(1.0e-4)
-    # Hiss tails in observed failures sit around zcr ~= 0.17 and
-    # flatness ~= 0.5, while voiced speech is much lower on both.
-    noise_like = (
-        (rms > 0.01 * speech_rms_ref)
-        & (rms < 0.75 * speech_rms_ref)
-        & (zcr > 0.11)
-        & (flatness > 0.28)
+    mel_rms = torch.sqrt(torch.mean(torch.exp(mel.detach().float().cpu()) ** 2, dim=-1))
+    plateau = torch.isclose(
+        mel_rms[0],
+        torch.ones((), dtype=mel_rms.dtype),
+        rtol=0.0,
+        atol=rms_tol,
+    )
+    min_frames = max(
+        1,
+        int(math.ceil(min_noise_ms * sampling_rate / (1000.0 * 256))),
     )
 
-    last_good = len(noise_like) - 1
-    min_frames = max(1, int(math.ceil(min_noise_ms / 10.0)))
-    count = 0
-    idx = len(noise_like) - 1
-    while idx >= 0 and bool(noise_like[idx]):
-        count += 1
-        idx -= 1
+    plateau_start = None
+    run = 0
+    for idx, is_plateau in enumerate(plateau.tolist()):
+        if is_plateau:
+            run += 1
+            if run >= min_frames:
+                plateau_start = idx - run + 1
+                break
+        else:
+            run = 0
 
-    if count < min_frames:
+    if plateau_start is None:
         return wav, 0
 
-    trim_start_frame = last_good - count + 1
-    trim_sample = trim_start_frame * hop
-    keep_samples = int(round(keep_ms * sampling_rate / 1000.0))
-    cut_sample = max(0, trim_sample - keep_samples)
+    samples_per_frame = x.size(-1) / max(1, mel.size(1))
+    cut_sample = max(0, int(round(plateau_start * samples_per_frame)))
     trimmed_samples = x.size(-1) - cut_sample
     if trimmed_samples <= 0:
         return wav, 0
@@ -983,7 +973,7 @@ def generate_sentence(
 
     # Add punctuation in the end if there is not
     text = add_punctuation(text)
-    text = text[:-1] + "___."
+    text = text[:-1] + "__."
     print(f"text:{text}")
     prompt_text = add_punctuation(prompt_text)
 
@@ -1019,6 +1009,7 @@ def generate_sentence(
     prompt_mel_len = prompt_features.size(1)
 
     output_wav = []
+    output_mel = []
     debug_history = []
 
     if total_target_words == 0:
@@ -1147,6 +1138,7 @@ def generate_sentence(
                 sample_rate=sampling_rate,
             )
         output_wav.append(wav)
+        output_mel.append(model_chunk)
 
         # Finish model generation
         t = (dt.datetime.now() - start_t).total_seconds()
@@ -1182,10 +1174,33 @@ def generate_sentence(
                 )
                 with torch.inference_mode():
                     logits = word_pointer(wp_mel, wp_mel_lens, wp_tokens, wp_token_lens)
-                label = int(logits.argmax(dim=-1).item())
+                probs = torch.softmax(logits[0], dim=-1)
+                best_prob, best_label = probs.max(dim=-1)
+                label = int(best_label.item())
                 pred_l, pred_r = WordPointer.decode_label(label, max_pad=wp_max_pad)
+                wp_conf = float(best_prob.item())
+                wp_decision = "argmax"
+                fallback_l = 1
+                fallback_min_prob = 0.05
+                if wp_conf < 0.7 and fallback_l <= wp_max_pad:
+                    n_pad = wp_max_pad + 1
+                    row_start = fallback_l * n_pad
+                    row_probs = probs[row_start : row_start + n_pad]
+                    row_best_prob, row_best_r = row_probs.max(dim=-1)
+                    if float(row_best_prob.item()) > fallback_min_prob:
+                        pred_l = fallback_l
+                        pred_r = int(row_best_r.item())
+                        label = row_start + pred_r
+                        wp_decision = "fallback_left1"
+                        wp_conf = float(row_best_prob.item())
                 wp_pred = (pred_l, pred_r)
-                wp_info = {"label": label, "pred_left": pred_l, "pred_right": pred_r}
+                wp_info = {
+                    "label": label,
+                    "pred_left": pred_l,
+                    "pred_right": pred_r,
+                    "conf": wp_conf,
+                    "decision": wp_decision,
+                }
 
         if wp_pred is not None:
             _, pred_r = wp_pred
@@ -1276,7 +1291,8 @@ def generate_sentence(
                 f"  step {i} end: src={src} committed={committed_word_pos} "
                 f"lookahead_end={lookahead_end} "
                 f"pred_left={wp_info['pred_left']} pred_right={wp_info['pred_right']} "
-                f"label={wp_info['label']}"
+                f"label={wp_info['label']} conf={wp_info['conf']:.4f} "
+                f"decision={wp_info['decision']}"
             )
         else:
             logging.info(
@@ -1293,15 +1309,16 @@ def generate_sentence(
 
     final_wav = torch.cat(output_wav, dim=-1)
     if trim_tail_noise:
+        final_mel = torch.cat(output_mel, dim=1)
         final_wav, trimmed_samples = trim_trailing_noise(
             final_wav,
+            final_mel,
             sampling_rate=sampling_rate,
             min_noise_ms=tail_noise_min_ms,
-            keep_ms=tail_noise_keep_ms,
         )
         if trimmed_samples > 0:
             logging.info(
-                "Trimmed trailing broadband noise: %.3fs",
+                "Trimmed trailing RMS=1 mel plateau: %.3fs",
                 trimmed_samples / sampling_rate,
             )
     _save_stream_summary_plot(
