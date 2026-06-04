@@ -261,6 +261,43 @@ def get_parser():
     )
 
     parser.add_argument(
+        "--lookahead-words",
+        type=int,
+        default=3,
+        help="Number of future target words exposed beyond the estimated "
+             "current-window word position in each streaming chunk.",
+    )
+
+    parser.add_argument(
+        "--history-context-chunks",
+        type=int,
+        default=-1,
+        help="Number of previous generated streaming chunks kept as speech "
+             "context for the next chunk. -1 keeps all generated history, "
+             "0 uses only the original prompt speech.",
+    )
+
+    parser.add_argument(
+        "--advance-mode",
+        type=str,
+        default="word_pointer",
+        choices=[
+            "word_pointer",
+            "wp_right_only",
+            "wp_ratio_clamped",
+            "ratio",
+            "fixed_words",
+        ],
+        help="Text advancement strategy for streaming inference. "
+             "'word_pointer' uses the trained pointer; 'ratio' advances by "
+             "generated-frame ratio; 'fixed_words' advances a fixed estimated "
+             "number of words per chunk; 'wp_right_only' uses WordPointer only "
+             "to estimate how many words at the right edge remain unspoken; "
+             "'wp_ratio_clamped' uses ratio as the primary progress estimate "
+             "and lets WordPointer adjust it within a small range.",
+    )
+
+    parser.add_argument(
         "--speed",
         type=float,
         default=1.0,
@@ -293,6 +330,13 @@ def get_parser():
         type=int,
         default=1,
         help="Number of threads to use for PyTorch on CPU.",
+    )
+
+    parser.add_argument(
+        "--cuda-device",
+        type=int,
+        default=0,
+        help="CUDA device index used for inference when CUDA is available.",
     )
 
     parser.add_argument(
@@ -346,6 +390,14 @@ def get_parser():
         type=str2bool,
         default=False,
         help="Whether to save each decoded streaming chunk as a separate wav.",
+    )
+
+    parser.add_argument(
+        "--first-chunk-only",
+        type=str2bool,
+        default=False,
+        help="Stop after decoding the first streaming chunk. This is intended "
+             "for measuring first-chunk synthesis latency.",
     )
 
     parser.add_argument(
@@ -864,9 +916,13 @@ def generate_sentence(
     word_pointer: Optional[torch.nn.Module] = None,
     wp_max_pad: int = 4,
     wp_min_frames: int = 150,
+    lookahead_words: int = 3,
+    history_context_chunks: int = -1,
+    advance_mode: str = "word_pointer",
     debug_plot_dir: Optional[Path] = None,
     debug_plot_every: int = 1,
     save_chunk_wavs: bool = False,
+    first_chunk_only: bool = False,
     trim_tail_noise: bool = True,
     tail_noise_min_ms: float = 120.0,
     tail_noise_keep_ms: float = 40.0,
@@ -974,12 +1030,14 @@ def generate_sentence(
     # Add punctuation in the end if there is not
     text = add_punctuation(text)
     text = text[:-1] + "__."
-    print(f"text:{text}")
+    logging.debug(f"Target text: {text}")
     prompt_text = add_punctuation(prompt_text)
 
     # Fixed-window streaming setup.
     fixed_chunk_frames = 150
     frame_rate = 24000 / 256
+    lookahead_words = max(0, int(lookahead_words))
+    history_context_chunks = int(history_context_chunks)
 
     # Use text.split() (NOT a punctuation-stripping regex) so the words
     # passed to the WordPointer head match the trainer's tokenization
@@ -1006,7 +1064,9 @@ def generate_sentence(
     generated_new_frames = 0
     committed_word_pos = 0
     base_prompt_text = prompt_text
-    prompt_mel_len = prompt_features.size(1)
+    base_prompt_features = prompt_features
+    prompt_mel_len = base_prompt_features.size(1)
+    generated_chunk_history = []
 
     output_wav = []
     output_mel = []
@@ -1022,18 +1082,22 @@ def generate_sentence(
             "rtf": 0.0,
             "rtf_no_vocoder": 0.0,
             "rtf_vocoder": 0.0,
+            "first_chunk_t": 0.0,
+            "first_chunk_stream_t": 0.0,
         }
 
     num_iter = max(1, int(np.ceil(est_total_new_frames / fixed_chunk_frames))) + 1
 
-    # Words synthesized per chunk (used to project committed → expected when
-    # picking the text window for this step). It's an estimate; the next
-    # step's CTC corrects any drift via committed_word_pos.
+    # Words synthesized per chunk. WordPointer refines this estimate; the
+    # baseline modes use it directly or combine it with frame-ratio progress.
     words_per_chunk = max(
         1,
         int(np.ceil(total_target_words * fixed_chunk_frames / est_total_new_frames)),
     )
 
+    stream_start_t = dt.datetime.now()
+    first_chunk_t = None
+    first_chunk_stream_t = None
     for i in range(num_iter):
         # Expected synthesized position after this step. Pure extrapolation
         # from committed_word_pos (= what the prompt actually covers) plus
@@ -1043,31 +1107,58 @@ def generate_sentence(
             total_target_words,
             committed_word_pos + words_per_chunk + 1,
         )
-        print(f"expected_word_pos:{expected_word_pos} total_target_words:{total_target_words} committed_word_pos:{committed_word_pos}")
+        logging.debug(
+            f"expected_word_pos={expected_word_pos} "
+            f"total_target_words={total_target_words} "
+            f"committed_word_pos={committed_word_pos}"
+        )
 
-        logging.info(
+        logging.debug(
             f"  step {i}: committed={committed_word_pos} "
             f"expected={expected_word_pos} (words_per_chunk={words_per_chunk})"
         )
 
-        # Send a few words of look-ahead beyond the expected end-of-step
+        # Send configurable look-ahead words beyond the expected end-of-step
         # position so cross-attention has future context.
-        lookahead_end = min(total_target_words, expected_word_pos + 3)
+        lookahead_end = min(total_target_words, expected_word_pos + lookahead_words)
         if lookahead_end <= committed_word_pos:
-            lookahead_end = min(total_target_words, committed_word_pos + 3)
+            lookahead_end = min(total_target_words, committed_word_pos + 1)
 
         text_chunk_words = target_words[committed_word_pos:lookahead_end]
         if len(text_chunk_words) == 0:
             break
 
+        chunk_start_word_pos = committed_word_pos
         text_chunk_str = " ".join(text_chunk_words)
-        print(
+        logging.debug(
             f"Processing chunk {i}: {text_chunk_str}, committed={committed_word_pos}, "
             f"expected={expected_word_pos}, lookahead_end={lookahead_end}"
         )
+
+        if history_context_chunks < 0:
+            context_history = generated_chunk_history
+        elif history_context_chunks == 0:
+            context_history = []
+        else:
+            context_history = generated_chunk_history[-history_context_chunks:]
+
+        if context_history:
+            context_features = [h["features"] for h in context_history]
+            context_word_start = context_history[0]["start_word_pos"]
+            context_words = target_words[context_word_start:committed_word_pos]
+            prompt_features_for_model = torch.cat(
+                [base_prompt_features] + context_features, dim=1
+            )
+            prompt_text_for_model = (
+                base_prompt_text + " " + " ".join(context_words)
+            ).strip()
+        else:
+            prompt_features_for_model = base_prompt_features
+            prompt_text_for_model = base_prompt_text
+
         # Tokenize text (str tokens), punctuations will be preserved.
         tokens_str = tokenizer.texts_to_tokens([text_chunk_str])[0]
-        prompt_tokens_str = tokenizer.texts_to_tokens([prompt_text + " "])[0]
+        prompt_tokens_str = tokenizer.texts_to_tokens([prompt_text_for_model + " "])[0]
 
         chunked_tokens_str = chunk_tokens_punctuation(tokens_str, max_tokens=1000)
         # Tokenize text (int tokens)
@@ -1088,8 +1179,11 @@ def generate_sentence(
         ) = model.sample(
             tokens=tokens,
             prompt_tokens=prompt_tokens,
-            prompt_features=prompt_features,
-            prompt_features_lens=torch.tensor(prompt_features.size(1)).unsqueeze(0).to(prompt_features.device),
+            prompt_features=prompt_features_for_model,
+            prompt_features_lens=torch.tensor(
+                [prompt_features_for_model.size(1)],
+                device=prompt_features_for_model.device,
+            ),
             speed=speed,
             t_shift=t_shift,
             duration="predict",
@@ -1125,11 +1219,15 @@ def generate_sentence(
         #     .squeeze(1)
         #     .clamp(-1, 1)
         # )
-        print(f"Chunk generated, duration: {wav.shape[-1] / sampling_rate}s")
+        logging.debug(f"Chunk generated, duration: {wav.shape[-1] / sampling_rate}s")
         # Adjust wav volume if necessary
         if prompt_rms < target_rms:
             wav = wav * prompt_rms / target_rms
-        print(f"wav rms: {torch.sqrt(torch.mean(wav**2))} wav:{wav}")
+        if first_chunk_t is None:
+            now_t = dt.datetime.now()
+            first_chunk_t = (now_t - start_t).total_seconds()
+            first_chunk_stream_t = (now_t - stream_start_t).total_seconds()
+        logging.debug(f"wav rms: {torch.sqrt(torch.mean(wav**2)).item():.6f}")
         if save_chunk_wavs:
             chunk_name = _safe_plot_name(text_chunk_str, max_len=120)
             torchaudio.save(
@@ -1143,7 +1241,6 @@ def generate_sentence(
         # Finish model generation
         t = (dt.datetime.now() - start_t).total_seconds()
         generated_new_frames += fixed_chunk_frames
-        prompt_features = torch.cat([prompt_features, model_chunk], dim=1)
 
         # End-of-step word-pointer decision: feed the most recent
         # ``wp_min_frames`` frames of generated mel together with this
@@ -1156,9 +1253,14 @@ def generate_sentence(
         wp_info = None
         wp_tokens_ids = []
         wp_mel = wp_mel_lens = wp_tokens = wp_token_lens = None
-        gen_mel_full = prompt_features[:, prompt_mel_len:, :]
-        gen_mel_len = gen_mel_full.size(1)
-        if word_pointer is not None and gen_mel_len >= wp_min_frames:
+        gen_mel_full = torch.cat(output_mel, dim=1) if output_mel else None
+        gen_mel_len = 0 if gen_mel_full is None else gen_mel_full.size(1)
+        if (
+            advance_mode in ("word_pointer", "wp_right_only", "wp_ratio_clamped")
+            and word_pointer is not None
+            and gen_mel_full is not None
+            and gen_mel_len >= wp_min_frames
+        ):
             wp_device = next(word_pointer.parameters()).device
             wp_mel = gen_mel_full[:, -wp_min_frames:, :].to(wp_device)
             wp_tokens_ids = tokenizer.texts_to_token_ids([text_chunk_str])[0]
@@ -1175,24 +1277,33 @@ def generate_sentence(
                 with torch.inference_mode():
                     logits = word_pointer(wp_mel, wp_mel_lens, wp_tokens, wp_token_lens)
                 probs = torch.softmax(logits[0], dim=-1)
-                best_prob, best_label = probs.max(dim=-1)
-                label = int(best_label.item())
-                pred_l, pred_r = WordPointer.decode_label(label, max_pad=wp_max_pad)
-                wp_conf = float(best_prob.item())
-                wp_decision = "argmax"
-                fallback_l = 1
-                fallback_min_prob = 0.05
-                if (wp_conf < 0.7 and fallback_l <= wp_max_pad) or wp_conf < 0.4:
-                    n_pad = wp_max_pad + 1
-                    row_start = fallback_l * n_pad
-                    row_probs = probs[row_start : row_start + n_pad]
-                    row_best_prob, row_best_r = row_probs.max(dim=-1)
-                    if float(row_best_prob.item()) > fallback_min_prob or wp_conf < 0.4:
-                        pred_l = fallback_l
-                        pred_r = int(row_best_r.item())
-                        label = row_start + pred_r
-                        wp_decision = "fallback_left1"
-                        wp_conf = float(row_best_prob.item())
+                n_pad = wp_max_pad + 1
+                if advance_mode == "wp_right_only":
+                    right_probs = probs.reshape(n_pad, n_pad).sum(dim=0)
+                    best_prob, best_r = right_probs.max(dim=-1)
+                    pred_l = 0
+                    pred_r = int(best_r.item())
+                    label = pred_r
+                    wp_conf = float(best_prob.item())
+                    wp_decision = "right_marginal"
+                else:
+                    best_prob, best_label = probs.max(dim=-1)
+                    label = int(best_label.item())
+                    pred_l, pred_r = WordPointer.decode_label(label, max_pad=wp_max_pad)
+                    wp_conf = float(best_prob.item())
+                    wp_decision = "argmax"
+                    fallback_l = 1
+                    fallback_min_prob = 0.05
+                    if (wp_conf < 0.7 and fallback_l <= wp_max_pad) or wp_conf < 0.4:
+                        row_start = fallback_l * n_pad
+                        row_probs = probs[row_start : row_start + n_pad]
+                        row_best_prob, row_best_r = row_probs.max(dim=-1)
+                        if float(row_best_prob.item()) > fallback_min_prob or wp_conf < 0.4:
+                            pred_l = fallback_l
+                            pred_r = int(row_best_r.item())
+                            label = row_start + pred_r
+                            wp_decision = "fallback_left1"
+                            wp_conf = float(row_best_prob.item())
                 wp_pred = (pred_l, pred_r)
                 wp_info = {
                     "label": label,
@@ -1202,7 +1313,45 @@ def generate_sentence(
                     "decision": wp_decision,
                 }
 
-        if wp_pred is not None:
+        ratio_pos = int(
+            np.floor(total_target_words * generated_new_frames / est_total_new_frames)
+        )
+        ratio_pos = min(
+            total_target_words,
+            max(committed_word_pos, ratio_pos),
+        )
+
+        if advance_mode == "wp_ratio_clamped":
+            if wp_pred is not None and wp_info is not None and wp_info["conf"] >= 0.7:
+                _, pred_r = wp_pred
+                wp_word_pos = lookahead_end - pred_r - 1
+                clamped_pos = min(ratio_pos + 1, max(ratio_pos - 1, wp_word_pos))
+                committed_word_pos = min(
+                    total_target_words,
+                    max(committed_word_pos, clamped_pos),
+                )
+                src = "wp_ratio_clamped"
+            else:
+                committed_word_pos = ratio_pos
+                src = "ratio"
+        elif advance_mode == "wp_right_only" and wp_pred is not None:
+            _, pred_r = wp_pred
+            wp_word_pos = lookahead_end - pred_r
+            committed_word_pos = min(
+                total_target_words,
+                max(committed_word_pos, wp_word_pos),
+            )
+            src = "wp_right"
+        elif advance_mode == "fixed_words":
+            committed_word_pos = min(
+                total_target_words,
+                max(committed_word_pos, committed_word_pos + words_per_chunk),
+            )
+            src = "fixed_words"
+        elif advance_mode == "ratio":
+            committed_word_pos = ratio_pos
+            src = "ratio"
+        elif wp_pred is not None:
             _, pred_r = wp_pred
             wp_word_pos = lookahead_end - pred_r - 1
             committed_word_pos = min(
@@ -1211,15 +1360,16 @@ def generate_sentence(
             )
             src = "wp"
         else:
-            # Ratio fallback: extrapolate from frames synthesized so far.
-            ratio_pos = int(
-                np.floor(total_target_words * generated_new_frames / est_total_new_frames)
-            )
-            committed_word_pos = min(
-                total_target_words,
-                max(committed_word_pos, ratio_pos),
-            )
+            committed_word_pos = ratio_pos
             src = "ratio"
+
+        generated_chunk_history.append(
+            {
+                "features": model_chunk,
+                "start_word_pos": chunk_start_word_pos,
+                "end_word_pos": committed_word_pos,
+            }
+        )
 
         debug_history.append(
             {
@@ -1287,7 +1437,7 @@ def generate_sentence(
             )
 
         if wp_info is not None:
-            logging.info(
+            logging.debug(
                 f"  step {i} end: src={src} committed={committed_word_pos} "
                 f"lookahead_end={lookahead_end} "
                 f"pred_left={wp_info['pred_left']} pred_right={wp_info['pred_right']} "
@@ -1295,16 +1445,14 @@ def generate_sentence(
                 f"decision={wp_info['decision']}"
             )
         else:
-            logging.info(
+            logging.debug(
                 f"  step {i} end: src={src} committed={committed_word_pos} (WP skipped)"
             )
 
-        prompt_text = (
-            base_prompt_text + " " + " ".join(target_words[:committed_word_pos])
-        ).strip()
-
         # Stop when all words are expected to be synthesized.
         if committed_word_pos >= total_target_words - 1:# and generated_new_frames >= est_total_new_frames:
+            break
+        if first_chunk_only:
             break
 
     final_wav = torch.cat(output_wav, dim=-1)
@@ -1328,7 +1476,7 @@ def generate_sentence(
         total_target_words=total_target_words,
         est_total_new_frames=est_total_new_frames,
     )
-    print(f"Final generated wav duration: {final_wav.shape[-1] / sampling_rate}s")
+    logging.debug(f"Final generated wav duration: {final_wav.shape[-1] / sampling_rate}s")
     # Calculate processing time metrics
     t_no_vocoder = (start_vocoder_t - start_t).total_seconds()
     t_vocoder = (dt.datetime.now() - start_vocoder_t).total_seconds()
@@ -1344,6 +1492,10 @@ def generate_sentence(
         "rtf": rtf,
         "rtf_no_vocoder": rtf_no_vocoder,
         "rtf_vocoder": rtf_vocoder,
+        "first_chunk_t": first_chunk_t if first_chunk_t is not None else 0.0,
+        "first_chunk_stream_t": (
+            first_chunk_stream_t if first_chunk_stream_t is not None else 0.0
+        ),
     }
 
     safe_prompt = re.sub(r"[^A-Za-z0-9._-]", "_", prompt_text)[:80]
@@ -1373,9 +1525,13 @@ def generate_list(
     word_pointer: Optional[torch.nn.Module] = None,
     wp_max_pad: int = 4,
     wp_min_frames: int = 150,
+    lookahead_words: int = 3,
+    history_context_chunks: int = -1,
+    advance_mode: str = "word_pointer",
     debug_plot_dir: Optional[Path] = None,
     debug_plot_every: int = 1,
     save_chunk_wavs: bool = False,
+    first_chunk_only: bool = False,
     trim_tail_noise: bool = True,
     tail_noise_min_ms: float = 120.0,
     tail_noise_keep_ms: float = 40.0,
@@ -1384,6 +1540,8 @@ def generate_list(
     total_t_no_vocoder = []
     total_t_vocoder = []
     total_wav_seconds = []
+    total_first_chunk_t = []
+    total_first_chunk_stream_t = []
 
     with open(test_list, "r") as fr:
         lines = fr.readlines()
@@ -1421,15 +1579,27 @@ def generate_list(
                 word_pointer=word_pointer,
                 wp_max_pad=wp_max_pad,
                 wp_min_frames=wp_min_frames,
+                lookahead_words=lookahead_words,
+                history_context_chunks=history_context_chunks,
+                advance_mode=advance_mode,
                 debug_plot_dir=debug_plot_dir,
                 debug_plot_every=debug_plot_every,
                 save_chunk_wavs=save_chunk_wavs,
+                first_chunk_only=first_chunk_only,
                 trim_tail_noise=trim_tail_noise,
                 tail_noise_min_ms=tail_noise_min_ms,
                 tail_noise_keep_ms=tail_noise_keep_ms,
             )
         logging.info(f"[Sentence: {i}] Saved to: {save_path}")
         logging.info(f"[Sentence: {i}] RTF: {metrics['rtf']:.4f}")
+        if "first_chunk_t" in metrics:
+            logging.info(
+                f"[Sentence: {i}] First chunk latency: "
+                f"{metrics['first_chunk_t']:.4f}s "
+                f"(stream loop: {metrics['first_chunk_stream_t']:.4f}s)"
+            )
+            total_first_chunk_t.append(metrics["first_chunk_t"])
+            total_first_chunk_stream_t.append(metrics["first_chunk_stream_t"])
         total_t.append(metrics["t"])
         total_t_no_vocoder.append(metrics["t_no_vocoder"])
         total_t_vocoder.append(metrics["t_vocoder"])
@@ -1444,6 +1614,34 @@ def generate_list(
         f"Average RTF vocoder: "
         f"{np.sum(total_t_vocoder) / np.sum(total_wav_seconds):.4f}"
     )
+    if total_first_chunk_t:
+        logging.info(
+            f"Average first chunk latency: {np.mean(total_first_chunk_t):.4f}s"
+        )
+        logging.info(
+            f"Average first chunk latency from stream loop: "
+            f"{np.mean(total_first_chunk_stream_t):.4f}s"
+        )
+
+    summary = {
+        "num_sentences": len(total_wav_seconds),
+        "avg_rtf": float(np.sum(total_t) / np.sum(total_wav_seconds)),
+        "avg_rtf_no_vocoder": float(
+            np.sum(total_t_no_vocoder) / np.sum(total_wav_seconds)
+        ),
+        "avg_rtf_vocoder": float(np.sum(total_t_vocoder) / np.sum(total_wav_seconds)),
+        "avg_first_chunk_latency": (
+            float(np.mean(total_first_chunk_t)) if total_first_chunk_t else None
+        ),
+        "avg_first_chunk_stream_latency": (
+            float(np.mean(total_first_chunk_stream_t))
+            if total_first_chunk_stream_t
+            else None
+        ),
+    }
+    summary_path = Path(res_dir) / "metrics_summary.json"
+    summary_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
+    logging.info(f"Saved metrics summary to: {summary_path}")
 
 
 @torch.inference_mode()
@@ -1545,7 +1743,7 @@ def main():
         raise NotImplementedError(f"Unsupported model checkpoint format: {model_ckpt}")
 
     if torch.cuda.is_available():
-        params.device = torch.device("cuda", 0)
+        params.device = torch.device("cuda", params.cuda_device)
     elif torch.backends.mps.is_available():
         params.device = torch.device("mps")
     else:
@@ -1558,40 +1756,45 @@ def main():
     if params.trt_engine_path:
         load_trt(model, params.trt_engine_path)
 
-    assert params.word_pointer_ckpt is not None, (
-        "Streaming inference requires --word-pointer-ckpt PATH."
-    )
-    logging.info(f"Loading WordPointer from {params.word_pointer_ckpt}")
-    wp_ckpt = torch.load(
-        params.word_pointer_ckpt, map_location="cpu", weights_only=False
-    )
-    wp_vocab_size = int(wp_ckpt.get("vocab_size", tokenizer.vocab_size))
-    wp_params = wp_ckpt.get("params", {}) or {}
-    wp_max_pad = int(wp_ckpt.get("max_pad", wp_params.get("max_pad", params.word_pointer_max_pad)))
-    assert wp_max_pad == params.word_pointer_max_pad, (
-        f"--word-pointer-max-pad={params.word_pointer_max_pad} disagrees with "
-        f"checkpoint's max_pad={wp_max_pad}; pass the matching value."
-    )
-    wp_chunk_frames = int(wp_ckpt.get("chunk_frames", wp_params.get("chunk_frames", 150)))
-    word_pointer = WordPointer(
-        vocab_size=wp_vocab_size,
-        max_pad=wp_max_pad,
-        mel_in_dim=int(model_config["model"].get("feat_dim", 100)),
-        dim=int(wp_params.get("dim", 128)),
-        mel_encoder_layers=int(wp_params.get("mel_encoder_layers", 2)),
-        text_encoder_layers=int(wp_params.get("text_encoder_layers", 2)),
-        cross_attn_layers=int(wp_params.get("cross_attn_layers", 2)),
-        num_heads=int(wp_params.get("num_heads", 4)),
-        feedforward_dim=int(wp_params.get("feedforward_dim", 512)),
-        dropout=float(wp_params.get("dropout", 0.0)),
-    )
-    word_pointer.load_state_dict(wp_ckpt["model"])
-    word_pointer = word_pointer.to(params.device).eval()
-    logging.info(
-        f"WordPointer: vocab_size={wp_vocab_size} max_pad={wp_max_pad} "
-        f"chunk_frames={wp_chunk_frames} "
-        f"params={sum(p.numel() for p in word_pointer.parameters())}"
-    )
+    word_pointer = None
+    wp_max_pad = params.word_pointer_max_pad
+    if params.advance_mode in ("word_pointer", "wp_right_only", "wp_ratio_clamped"):
+        assert params.word_pointer_ckpt is not None, (
+            "WordPointer-based mode requires --word-pointer-ckpt PATH."
+        )
+        logging.info(f"Loading WordPointer from {params.word_pointer_ckpt}")
+        wp_ckpt = torch.load(
+            params.word_pointer_ckpt, map_location="cpu", weights_only=False
+        )
+        wp_vocab_size = int(wp_ckpt.get("vocab_size", tokenizer.vocab_size))
+        wp_params = wp_ckpt.get("params", {}) or {}
+        wp_max_pad = int(wp_ckpt.get("max_pad", wp_params.get("max_pad", params.word_pointer_max_pad)))
+        assert wp_max_pad == params.word_pointer_max_pad, (
+            f"--word-pointer-max-pad={params.word_pointer_max_pad} disagrees with "
+            f"checkpoint's max_pad={wp_max_pad}; pass the matching value."
+        )
+        wp_chunk_frames = int(wp_ckpt.get("chunk_frames", wp_params.get("chunk_frames", 150)))
+        word_pointer = WordPointer(
+            vocab_size=wp_vocab_size,
+            max_pad=wp_max_pad,
+            mel_in_dim=int(model_config["model"].get("feat_dim", 100)),
+            dim=int(wp_params.get("dim", 128)),
+            mel_encoder_layers=int(wp_params.get("mel_encoder_layers", 2)),
+            text_encoder_layers=int(wp_params.get("text_encoder_layers", 2)),
+            cross_attn_layers=int(wp_params.get("cross_attn_layers", 2)),
+            num_heads=int(wp_params.get("num_heads", 4)),
+            feedforward_dim=int(wp_params.get("feedforward_dim", 512)),
+            dropout=float(wp_params.get("dropout", 0.0)),
+        )
+        word_pointer.load_state_dict(wp_ckpt["model"])
+        word_pointer = word_pointer.to(params.device).eval()
+        logging.info(
+            f"WordPointer: vocab_size={wp_vocab_size} max_pad={wp_max_pad} "
+            f"chunk_frames={wp_chunk_frames} "
+            f"params={sum(p.numel() for p in word_pointer.parameters())}"
+        )
+    else:
+        logging.info(f"Using advancement baseline: {params.advance_mode}")
 
     vocoder = get_vocoder(params.vocoder_path)
     vocoder = vocoder.to(params.device)
@@ -1630,9 +1833,13 @@ def main():
             word_pointer=word_pointer,
             wp_max_pad=wp_max_pad,
             wp_min_frames=params.word_pointer_min_frames,
+            lookahead_words=params.lookahead_words,
+            history_context_chunks=params.history_context_chunks,
+            advance_mode=params.advance_mode,
             debug_plot_dir=params.debug_plot_dir,
             debug_plot_every=params.debug_plot_every,
             save_chunk_wavs=params.save_chunk_wavs,
+            first_chunk_only=params.first_chunk_only,
             trim_tail_noise=params.trim_tail_noise,
             tail_noise_min_ms=params.tail_noise_min_ms,
             tail_noise_keep_ms=params.tail_noise_keep_ms,
@@ -1663,9 +1870,13 @@ def main():
             word_pointer=word_pointer,
             wp_max_pad=wp_max_pad,
             wp_min_frames=params.word_pointer_min_frames,
+            lookahead_words=params.lookahead_words,
+            history_context_chunks=params.history_context_chunks,
+            advance_mode=params.advance_mode,
             debug_plot_dir=params.debug_plot_dir,
             debug_plot_every=params.debug_plot_every,
             save_chunk_wavs=params.save_chunk_wavs,
+            first_chunk_only=params.first_chunk_only,
             trim_tail_noise=params.trim_tail_noise,
             tail_noise_min_ms=params.tail_noise_min_ms,
             tail_noise_keep_ms=params.tail_noise_keep_ms,

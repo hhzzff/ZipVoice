@@ -71,6 +71,18 @@ def get_parser() -> argparse.ArgumentParser:
         default="wav",
         help="Extension of the speech files. Default: wav",
     )
+    parser.add_argument(
+        "--score-path",
+        type=str,
+        default=None,
+        help="Optional path to save the final SIM-o score.",
+    )
+    parser.add_argument(
+        "--cuda-device",
+        type=int,
+        default=0,
+        help="CUDA device index used when CUDA is available.",
+    )
     return parser
 
 
@@ -84,6 +96,7 @@ class SpeakerSimilarity:
         self,
         sv_model_path: str = "speaker_similarity/wavlm_large_finetune.pth",
         ssl_model_path: str = "speaker_similarity/wavlm_large/",
+        cuda_device: int = 0,
     ):
         """
         Initializes the speaker similarity evaluator with the specified models.
@@ -93,8 +106,8 @@ class SpeakerSimilarity:
             ssl_model_path (str): Path of the wavlm SSL model directory.
         """
         self.sample_rate = 16000
-        self.device = (
-            torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
+        self.device = torch.device(
+            f"cuda:{cuda_device}" if torch.cuda.is_available() else "cpu"
         )
         logging.info(f"Using device: {self.device}")
         self.model = ECAPA_TDNN_WAVLM(
@@ -220,10 +233,15 @@ if __name__ == "__main__":
         )
         exit(1)
     sim_evaluator = SpeakerSimilarity(
-        sv_model_path=sv_model_path, ssl_model_path=ssl_model_path
+        sv_model_path=sv_model_path,
+        ssl_model_path=ssl_model_path,
+        cuda_device=args.cuda_device,
     )
     # Compute similarity score
     score = sim_evaluator.score(args.wav_path, args.extension, args.test_list)
     print("-" * 50)
     logging.info(f"SIM-o score: {score:.3f}")
     print("-" * 50)
+    if args.score_path:
+        with open(args.score_path, "w", encoding="utf-8") as f:
+            f.write(f"SIM-o score: {score:.6f}\n")

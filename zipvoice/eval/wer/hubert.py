@@ -83,6 +83,12 @@ def get_parser():
         default=16,
         help="Batch size for decoding with the Hugging Face pipeline.",
     )
+    parser.add_argument(
+        "--cuda-device",
+        type=int,
+        default=0,
+        help="CUDA device index used for WER decoding when CUDA is available.",
+    )
     return parser
 
 
@@ -271,7 +277,7 @@ if __name__ == "__main__":
     parser = get_parser()
     args = parser.parse_args()
     if torch.cuda.is_available():
-        device = torch.device("cuda", 0)
+        device = torch.device("cuda", args.cuda_device)
     else:
         device = torch.device("cpu")
     main(

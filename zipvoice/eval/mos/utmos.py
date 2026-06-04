@@ -58,13 +58,32 @@ def get_parser() -> argparse.ArgumentParser:
         default="wav",
         help="Extension of the speech files. Default: wav",
     )
+    parser.add_argument(
+        "--test-list",
+        type=str,
+        default=None,
+        help="Optional TSV list. When set, only wavs named by the first column "
+        "are scored, avoiding prompt or debug wavs in the same directory.",
+    )
+    parser.add_argument(
+        "--score-path",
+        type=str,
+        default=None,
+        help="Optional path to save the final UTMOS score.",
+    )
+    parser.add_argument(
+        "--cuda-device",
+        type=int,
+        default=0,
+        help="CUDA device index used when CUDA is available.",
+    )
     return parser
 
 
 class UTMOSScore:
     """Predicting UTMOS score for each audio clip."""
 
-    def __init__(self, model_path: str):
+    def __init__(self, model_path: str, cuda_device: int = 0):
         """
         Initializes the UTMOS score evaluator with the specified model.
 
@@ -72,8 +91,8 @@ class UTMOSScore:
             model_path (str): Path of the UTMOS model checkpoint.
         """
         self.sample_rate = 16000
-        self.device = (
-            torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
+        self.device = torch.device(
+            f"cuda:{cuda_device}" if torch.cuda.is_available() else "cpu"
         )
         logging.info(f"Using device: {self.device}")
 
@@ -112,7 +131,7 @@ class UTMOSScore:
 
         return scores
 
-    def score_dir(self, dir_path: str, extension: str) -> float:
+    def score_dir(self, dir_path: str, extension: str, test_list: str = None) -> float:
         """
         Computes the average UTMOS score for all files in a directory.
 
@@ -124,12 +143,22 @@ class UTMOSScore:
         """
         logging.info(f"Calculating UTMOS score for {dir_path}")
 
-        # Get list of wav files
-        wav_files = [
-            os.path.join(dir_path, f)
-            for f in os.listdir(dir_path)
-            if f.lower().endswith(extension)
-        ]
+        if test_list:
+            wav_files = []
+            with open(test_list, "r", encoding="utf-8") as f:
+                for line in f:
+                    if not line.strip():
+                        continue
+                    wav_name = line.rstrip("\n").split("\t")[0]
+                    wav_files.append(os.path.join(dir_path, f"{wav_name}.{extension}"))
+        else:
+            wav_files = [
+                os.path.join(dir_path, f)
+                for f in os.listdir(dir_path)
+                if f.lower().endswith(extension)
+                and not f.endswith("_prompt.wav")
+                and "_chunk_" not in f
+            ]
 
         if not wav_files:
             raise ValueError(f"No audio files found in {dir_path}")
@@ -165,10 +194,13 @@ if __name__ == "__main__":
             " and pass this dir with --model-dir"
         )
         exit(1)
-    utmos_evaluator = UTMOSScore(model_path)
+    utmos_evaluator = UTMOSScore(model_path, cuda_device=args.cuda_device)
 
     # Compute UTMOS score
-    score = utmos_evaluator.score_dir(args.wav_path, args.extension)
+    score = utmos_evaluator.score_dir(args.wav_path, args.extension, args.test_list)
     print("-" * 50)
     logging.info(f"UTMOS score: {score:.2f}")
     print("-" * 50)
+    if args.score_path:
+        with open(args.score_path, "w", encoding="utf-8") as f:
+            f.write(f"UTMOS score: {score:.6f}\n")

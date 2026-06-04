@@ -1,8 +1,8 @@
 import logging
 
-import librosa
 import soundfile as sf
 import torch
+import torchaudio.functional as F
 
 
 def load_waveform(
@@ -44,7 +44,9 @@ def load_waveform(
 
     # Resample to target sample rate if needed
     if sr != sample_rate:
-        wav_data = librosa.resample(wav_data, orig_sr=sr, target_sr=sample_rate)
+        wav_data = F.resample(
+            torch.from_numpy(wav_data), orig_freq=sr, new_freq=sample_rate
+        ).numpy()
 
     if max_seconds is not None:
         # Trim to max length

@@ -1,13 +1,19 @@
 if [[ ":$PYTHONPATH:" != *":$(pwd):"* ]]; then
     export PYTHONPATH="$PYTHONPATH:../../."
 fi
-export CUDA_VISIBLE_DEVICES="0,1,2,3"
+export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
 
+RESUME_WORD_POINTER_CKPT="${RESUME_WORD_POINTER_CKPT:-exp_pointer/libritts_0514_1704/word_pointer.pt}"
 TS="$(date +%m%d_%H%M)"
-EXP_DIR="exp_pointer/libritts_${TS}"
+EXP_DIR="${EXP_DIR:-exp_pointer/libritts_resume_${TS}}"
 CONFIG_FILE="conf/zipvoice_base-1500ms.json"
-PRETRAINED_CKPT=""
-RESUME_WORD_POINTER_CKPT="${RESUME_WORD_POINTER_CKPT:-}"
+
+if [ ! -f "$RESUME_WORD_POINTER_CKPT" ]; then
+    echo "Error: RESUME_WORD_POINTER_CKPT does not exist: $RESUME_WORD_POINTER_CKPT"
+    echo "Set it explicitly, e.g.:"
+    echo "  RESUME_WORD_POINTER_CKPT=exp_pointer/xxx/word_pointer.pt bash run/train_word_pointer_resume.sh"
+    exit 1
+fi
 
 if [ -d "$EXP_DIR" ]; then
     echo "Error: Directory '$EXP_DIR' already exists. Aborting to avoid overwriting."
@@ -18,21 +24,8 @@ mkdir -p "$EXP_DIR"
 SCRIPT_PATH="$(readlink -f "$0")"
 cp "$SCRIPT_PATH" "$EXP_DIR/"
 cp "$CONFIG_FILE" "$EXP_DIR/"
-echo "Copied train_word_pointer.sh and $CONFIG_FILE to $EXP_DIR"
-
-PRETRAIN_FLAG=()
-if [ -n "$PRETRAINED_CKPT" ]; then
-    PRETRAIN_FLAG=(--pretrained-ckpt "$PRETRAINED_CKPT")
-    echo "Warm-starting WordPointer (strict=False) from $PRETRAINED_CKPT"
-else
-    echo "Training WordPointer from scratch."
-fi
-
-RESUME_FLAG=()
-if [ -n "$RESUME_WORD_POINTER_CKPT" ]; then
-    RESUME_FLAG=(--resume-word-pointer-ckpt "$RESUME_WORD_POINTER_CKPT")
-    echo "Resuming WordPointer from $RESUME_WORD_POINTER_CKPT"
-fi
+echo "Copied train_word_pointer_resume.sh and $CONFIG_FILE to $EXP_DIR"
+echo "Resuming WordPointer from $RESUME_WORD_POINTER_CKPT"
 
 python3 -m zipvoice.bin.train_word_pointer \
     --manifest-dir aligned_data/fbank \
@@ -40,6 +33,7 @@ python3 -m zipvoice.bin.train_word_pointer \
     --tokenizer libritts \
     --model-config "$CONFIG_FILE" \
     --exp-dir "$EXP_DIR" \
+    --resume-word-pointer-ckpt "$RESUME_WORD_POINTER_CKPT" \
     --max-duration 250 \
     --feat-scale 0.1 \
     --chunk-frames 150 \
@@ -51,8 +45,8 @@ python3 -m zipvoice.bin.train_word_pointer \
     --num-heads 8 \
     --feedforward-dim 1024 \
     --dropout 0.05 \
-    --steps 50000 \
-    --lr 1e-4 \
+    --steps 250000 \
+    --lr 6e-4 \
     --min-lr-ratio 0.2 \
     --augment-prob 0.8 \
     --volume-augment-prob 0.5 \
@@ -72,6 +66,4 @@ python3 -m zipvoice.bin.train_word_pointer \
     --num-eval-batches 200 \
     --num-tb-samples 6 \
     --tb-sample-topk 5 \
-    --seed 42 \
-    "${PRETRAIN_FLAG[@]}" \
-    "${RESUME_FLAG[@]}"
+    --seed 42

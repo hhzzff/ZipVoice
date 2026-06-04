@@ -3,7 +3,7 @@ if [[ ":$PYTHONPATH:" != *":$(pwd):"* ]]; then
 fi
 export CUDA_VISIBLE_DEVICES="0,1"
 
-EXP_DIR="exp/zipvoice_libritts_0512_1652_stream_alignmask_fixedwindow_crossattn"
+EXP_DIR="exp/zipvoice_libritts_0519_1237_stream_alignmask_fixedwindow_crossattn"
 CONFIG_FILE="conf/zipvoice_base-1500ms.json"
 
 python3 -m zipvoice.bin.train_zipvoice_stream_fixedwindow_crossattn \
@@ -22,4 +22,4 @@ python3 -m zipvoice.bin.train_zipvoice_stream_fixedwindow_crossattn \
 	--manifest-dir aligned_data/fbank \
 	--feat-scale 0.1 \
 	--master-port 11451 \
-	--start-epoch 46
+	--start-epoch 75

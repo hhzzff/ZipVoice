@@ -18,6 +18,7 @@ cp "$SCRIPT_PATH" "$EXP_DIR/"
 cp "$CONFIG_FILE" "$EXP_DIR/"
 echo "Copied train.sh, $CONFIG_FILE to $EXP_DIR"
 
+export VOCOS_LOCAL_PATH=/star-oss/hanzhifeng/streaming/ZipVoice/vocos-mel-24khz
 python3 -m zipvoice.bin.train_zipvoice_stream_fixedwindow_crossattn \
     --world-size 2 \
 	--use-fp16 0 \
