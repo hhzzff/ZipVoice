@@ -1,0 +1,122 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Streaming ZipVoice - Audio Samples</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <header class="masthead">
+    <div class="brand">Z</div>
+    <div class="title-block">
+      <h1>Streaming ZipVoice</h1>
+      <p>Zero-shot streaming text-to-speech - audio samples</p>
+    </div>
+    <a class="repo-link" href="https://github.com/k2-fsa/ZipVoice">ZipVoice repository</a>
+  </header>
+
+  <main>
+    <section class="intro">
+      <div>
+        <span class="eyebrow">Streaming evaluation</span>
+        <h2>Speech generated as text tokens arrive</h2>
+        <p>Samples use the current best streaming checkpoint with 32 flow-matching steps, token arrival every 0.5 decode tick, and generated rolling acoustic context.</p>
+      </div>
+      <dl class="headline-metrics">
+        <div><dt>WER</dt><dd>2.98%</dd></div>
+        <div><dt>RTF</dt><dd>&lt; 1.0</dd></div>
+        <div><dt>Test set</dt><dd>100</dd></div>
+      </dl>
+    </section>
+
+    <section class="samples">
+      <div class="section-title">
+        <div><span class="eyebrow">LibriSpeech-PC</span><h2>English zero-shot synthesis</h2></div>
+        <p>Reference audio and target text are unseen pairings.</p>
+      </div>
+
+      <div class="sample-table" role="table" aria-label="Zero-shot TTS samples">
+        <div class="table-head" role="row"><span>Voice prompt</span><span>Target text</span><span>Streaming ZipVoice</span></div>
+
+        <article class="sample-row" role="row">
+          <div class="prompt"><audio controls preload="none" src="audios/prompts/4992-41806-0009.wav"></audio><p>"exclaimed Bill Harmon to his wife as they went through the lighted hall."</p></div>
+          <p class="target">But the more forgetfulness had then prevailed, the more powerful was the force of remembrance when she awoke.</p>
+          <div class="output"><audio controls preload="none" src="audios/generated/4992-23283-0000.wav"></audio><span>4992-23283-0000</span></div>
+        </article>
+
+        <article class="sample-row" role="row">
+          <div class="prompt"><audio controls preload="none" src="audios/prompts/4992-41806-0004.wav"></audio><p>"Burn, fire, burn! Flicker, flicker, flame!"</p></div>
+          <p class="target">My Lord, Miss Milner's taste is not a depraved one; it is but too refined.</p>
+          <div class="output"><audio controls preload="none" src="audios/generated/4992-23283-0013.wav"></audio><span>4992-23283-0013</span></div>
+        </article>
+
+        <article class="sample-row" role="row">
+          <div class="prompt"><audio controls preload="none" src="audios/prompts/672-122797-0000.wav"></audio><p>"Out in the woods stood a nice little Fir Tree."</p></div>
+          <p class="target">I would fain know if I am destined for so glorious a career, cried the Tree, rejoicing.</p>
+          <div class="output"><audio controls preload="none" src="audios/generated/672-122797-0012.wav"></audio><span>672-122797-0012</span></div>
+        </article>
+
+        <article class="sample-row" role="row">
+          <div class="prompt"><audio controls preload="none" src="audios/prompts/672-122797-0032.wav"></audio><p>"cried the young ladies, and they quickly put out the fire."</p></div>
+          <p class="target">And towards Christmas he was one of the first that was cut down.</p>
+          <div class="output"><audio controls preload="none" src="audios/generated/672-122797-0021.wav"></audio><span>672-122797-0021</span></div>
+        </article>
+
+        <article class="sample-row" role="row">
+          <div class="prompt"><audio controls preload="none" src="audios/prompts/672-122797-0044.wav"></audio><p>"And he leaned against the wall lost in reverie."</p></div>
+          <p class="target">Thought the Fir Tree, and believed it all, because the man who told the story was so good looking. Well, well!</p>
+          <div class="output"><audio controls preload="none" src="audios/generated/672-122797-0038.wav"></audio><span>672-122797-0038</span></div>
+        </article>
+
+        <article class="sample-row" role="row">
+          <div class="prompt"><audio controls preload="none" src="audios/prompts/672-122797-0031.wav"></audio><p>"It blazed up famously. Help! Help!"</p></div>
+          <p class="target">I know no such place, said the Tree.</p>
+          <div class="output"><audio controls preload="none" src="audios/generated/672-122797-0054.wav"></audio><span>672-122797-0054</span></div>
+        </article>
+
+        <article class="sample-row" role="row">
+          <div class="prompt"><audio controls preload="none" src="audios/prompts/672-122797-0028.wav"></audio><p>"This evening! they all said."</p></div>
+          <p class="target">It was in a corner that he lay, among weeds and nettles.</p>
+          <div class="output"><audio controls preload="none" src="audios/generated/672-122797-0069.wav"></audio><span>672-122797-0069</span></div>
+        </article>
+
+        <article class="sample-row" role="row">
+          <div class="prompt"><audio controls preload="none" src="audios/prompts/2961-961-0005.wav"></audio><p>"Some poems of Solon were recited by the boys."</p></div>
+          <p class="target">But they have nothing to do with the interpretation of Plato, and in spirit they are opposed to him.</p>
+          <div class="output"><audio controls preload="none" src="audios/generated/2961-960-0007.wav"></audio><span>2961-960-0007</span></div>
+        </article>
+
+        <article class="sample-row" role="row">
+          <div class="prompt"><audio controls preload="none" src="audios/prompts/2961-961-0005.wav"></audio><p>"Some poems of Solon were recited by the boys."</p></div>
+          <p class="target">Plato had not the command of his materials which would have enabled him to produce a perfect work of art.</p>
+          <div class="output"><audio controls preload="none" src="audios/generated/2961-960-0022.wav"></audio><span>2961-960-0022</span></div>
+        </article>
+
+        <article class="sample-row" role="row">
+          <div class="prompt"><audio controls preload="none" src="audios/prompts/7176-92135-0027.wav"></audio><p>"Lady Larkspur starts suddenly and turns towards him."</p></div>
+          <p class="target">I've got a little idea for a play about a man and a woman and another woman, but perhaps I'd better keep the plot a secret for the moment.</p>
+          <div class="output"><audio controls preload="none" src="audios/generated/7176-92135-0006.wav"></audio><span>7176-92135-0006</span></div>
+        </article>
+
+        <article class="sample-row" role="row">
+          <div class="prompt"><audio controls preload="none" src="audios/prompts/7176-88083-0006.wav"></audio><p>"It might have seemed that a trout of this size was a fairly substantial meal."</p></div>
+          <p class="target">This would be an easy way of doing it, but it would not be the best way, for the reason that it is too easy to call attention to itself.</p>
+          <div class="output"><audio controls preload="none" src="audios/generated/7176-92135-0016.wav"></audio><span>7176-92135-0016</span></div>
+        </article>
+
+        <article class="sample-row" role="row">
+          <div class="prompt"><audio controls preload="none" src="audios/prompts/4077-13751-0019.wav"></audio><p>"Who began the quarrel? Was it the Mormons?"</p></div>
+          <p class="target">Their sufferings have never yet been fitly chronicled by human scribe.</p>
+          <div class="output"><audio controls preload="none" src="audios/generated/4077-13751-0013.wav"></audio><span>4077-13751-0013</span></div>
+        </article>
+      </div>
+    </section>
+
+    <footer>
+      <span>Checkpoint: zipvoice_streaming_stage1_from_b_arrival_0903 / checkpoint-500.pt</span>
+      <span>Seed 666 - uniform frame mapping - generated rolling context</span>
+    </footer>
+  </main>
+</body>
+</html>
